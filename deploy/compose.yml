@@ -13,9 +13,6 @@ services:
       timeout: 5s
       retries: 3
 
-volumes:
-  backend_data:
-
   frontend:
     build:
       context: ../../frontend
@@ -30,3 +27,6 @@ volumes:
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  backend_data:
