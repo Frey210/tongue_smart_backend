@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     environment:
       TONGUE_SMART_DATABASE_URL: "${TONGUE_SMART_DATABASE_URL:-sqlite+pysqlite:////data/tongue_smart.db}"
+      TONGUE_SMART_JWT_SECRET: "${TONGUE_SMART_JWT_SECRET:?set JWT secret in deploy/.env}"
+      TONGUE_SMART_BOOTSTRAP_ADMIN_EMAIL: "${TONGUE_SMART_BOOTSTRAP_ADMIN_EMAIL:-}"
+      TONGUE_SMART_BOOTSTRAP_ADMIN_PASSWORD: "${TONGUE_SMART_BOOTSTRAP_ADMIN_PASSWORD:-}"
     volumes:
       - backend_data:/data
     healthcheck:
