@@ -188,4 +188,13 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         assert results["summary"]["maximum"] == 12.4
         assert results["markers"][0]["label"] == "Tekanan puncak"
         assert results["notes"][0]["note"] == "Sinyal stabil."
+        export = client.post("/api/v1/exports", headers=headers, json={
+            "session_ids": [session["id"]], "data_mode": "both", "include_metadata": True, "include_markers": True,
+        })
+        assert export.status_code == 201 and export.json()["row_count"] == 1
+        download = client.get(f"/api/v1/exports/{export.json()['id']}/download", headers=headers)
+        assert download.status_code == 200
+        assert "text/csv" in download.headers["content-type"]
+        assert download.headers["x-content-sha256"] == export.json()["checksum"]
+        assert "Tekanan puncak" in download.text and "fsr_1" in download.text
         assert client.post(f"/api/v1/sessions/{session['id']}/finalize", headers=headers).json()["status"] == "completed"

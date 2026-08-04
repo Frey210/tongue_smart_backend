@@ -141,3 +141,20 @@ class OperatorNoteRecord(Base):
     actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     note: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ExportJobRecord(Base):
+    __tablename__ = "export_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    requested_by: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_ids: Mapped[list[str]] = mapped_column(JSON)
+    data_mode: Mapped[str] = mapped_column(String(24))
+    include_metadata: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_markers: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    row_count: Mapped[int] = mapped_column(Integer)
+    checksum: Mapped[str] = mapped_column(String(64))
+    filename: Mapped[str] = mapped_column(String(160))
+    csv_content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

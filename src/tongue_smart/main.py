@@ -1,14 +1,16 @@
 from contextlib import asynccontextmanager
+import csv
 from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
+from io import StringIO
 import os
 from typing import Annotated, Literal
 from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -17,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, EventMarkerRecord, ExaminationSessionRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -151,6 +153,13 @@ class EventMarkerCreate(BaseModel):
 
 class OperatorNoteCreate(BaseModel):
     note: str = Field(min_length=1, max_length=2000)
+
+
+class ExportCreate(BaseModel):
+    session_ids: list[str] = Field(min_length=1, max_length=100)
+    data_mode: Literal["raw", "processed", "both"] = "both"
+    include_metadata: bool = True
+    include_markers: bool = True
 
 
 class DeviceEvent(BaseModel):
@@ -695,6 +704,105 @@ def create_operator_note(
     add_audit(db, actor.id, "note.created", "examination_session", session_id)
     db.commit()
     return {"id": note.id, "actor_id": note.actor_id, "note": note.note, "created_at": note.created_at}
+
+
+def export_view(job: ExportJobRecord) -> dict[str, object]:
+    return {"id": job.id, "session_ids": job.session_ids, "data_mode": job.data_mode,
+            "include_metadata": job.include_metadata, "include_markers": job.include_markers,
+            "status": job.status, "row_count": job.row_count, "checksum": job.checksum,
+            "filename": job.filename, "created_at": job.created_at}
+
+
+def spreadsheet_safe(value: object) -> object:
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def utc_timestamp_key(value: datetime | str) -> str:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+@app.get("/api/v1/exports", tags=["exports"])
+def list_exports(
+    _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    return [export_view(job) for job in db.scalars(select(ExportJobRecord).order_by(desc(ExportJobRecord.created_at))).all()]
+
+
+@app.post("/api/v1/exports", status_code=201, tags=["exports"])
+def create_export(
+    payload: ExportCreate,
+    actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    sessions_by_id: dict[str, ExaminationSessionRecord] = {}
+    for session_id in dict.fromkeys(payload.session_ids):
+        session = db.get(ExaminationSessionRecord, session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"Sesi tidak ditemukan: {session_id}")
+        sessions_by_id[session_id] = session
+    output = StringIO(newline="")
+    base_headers = ["timestamp", "subject_id", "session_id", "protocol_stage", "sensor_channel", "raw_value",
+                    "calibrated_value", "measurement_unit", "signal_quality", "event_marker"]
+    metadata_headers = ["device_id", "session_status", "electrode_site", "operator_id"] if payload.include_metadata else []
+    writer = csv.DictWriter(output, fieldnames=base_headers + metadata_headers, lineterminator="\n")
+    writer.writeheader()
+    row_count = 0
+    for session_id, session in sessions_by_id.items():
+        subject = db.get(SubjectRecord, session.subject_id)
+        markers = db.scalars(select(EventMarkerRecord).where(EventMarkerRecord.session_id == session_id)).all() if payload.include_markers else []
+        marker_map: dict[str, list[str]] = {}
+        for marker in markers:
+            marker_map.setdefault(utc_timestamp_key(marker.occurred_at), []).append(marker.label)
+        batches = db.scalars(select(SampleBatchRecord).where(SampleBatchRecord.session_id == session_id).order_by(SampleBatchRecord.sequence)).all()
+        for batch in batches:
+            for sample in batch.samples:
+                timestamp = str(sample.get("timestamp", ""))
+                raw = sample.get("raw_value") if payload.data_mode in ("raw", "both") else ""
+                calibrated = sample.get("calibrated_value") if payload.data_mode in ("processed", "both") else ""
+                row = {"timestamp": timestamp, "subject_id": subject.subject_code if subject else session.subject_id,
+                       "session_id": session.session_code, "protocol_stage": sample.get("protocol_stage", ""),
+                       "sensor_channel": sample.get("sensor_channel", ""), "raw_value": raw,
+                       "calibrated_value": calibrated, "measurement_unit": sample.get("measurement_unit", ""),
+                       "signal_quality": sample.get("signal_quality", ""),
+                       "event_marker": " | ".join(marker_map.get(utc_timestamp_key(timestamp), []))}
+                if payload.include_metadata:
+                    row.update({"device_id": session.device_id, "session_status": session.status,
+                                "electrode_site": session.electrode_site or "", "operator_id": session.operator_id})
+                writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
+                row_count += 1
+    content = output.getvalue()
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    now = datetime.now(UTC)
+    job = ExportJobRecord(id=str(uuid4()), requested_by=actor.id, session_ids=list(sessions_by_id),
+                          data_mode=payload.data_mode, include_metadata=payload.include_metadata,
+                          include_markers=payload.include_markers, status="ready", row_count=row_count,
+                          checksum=checksum, filename=f"tongue-smart-export-{now:%Y%m%d-%H%M%S}.csv",
+                          csv_content=content, created_at=now)
+    db.add(job)
+    add_audit(db, actor.id, "export.created", "export_job", job.id, f"rows={row_count};checksum={checksum}")
+    db.commit()
+    return export_view(job)
+
+
+@app.get("/api/v1/exports/{export_id}/download", tags=["exports"])
+def download_export(
+    export_id: str,
+    actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> Response:
+    job = db.get(ExportJobRecord, export_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Export tidak ditemukan")
+    add_audit(db, actor.id, "export.downloaded", "export_job", job.id, job.checksum)
+    db.commit()
+    return Response(content="\ufeff" + job.csv_content, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{job.filename}"', "X-Content-SHA256": job.checksum})
 
 
 @app.post("/api/v1/device-events", status_code=status.HTTP_202_ACCEPTED, tags=["devices"])
