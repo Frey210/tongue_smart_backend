@@ -27,6 +27,7 @@ Firmware tidak memanggil logic dashboard. Frontend tidak mengakses database lang
 - Subject, ConsentRecord
 - Device, DeviceCapability, Calibration
 - ExaminationSession, ProtocolStage
+- EMG stage menyimpan `electrode_site` terstruktur dan `electrode_site_note` untuk pilihan lokasi lain.
 - SampleBatch, MeasurementSummary, EventMarker, OperatorNote
 - SyncReceipt, ExportJob, AuditEvent
 
@@ -47,6 +48,7 @@ Firmware tidak memanggil logic dashboard. Frontend tidak mengakses database lang
 ### B2 — Session ingest
 
 - Create/finalize examination session.
+- Validasi posisi elektroda sebagai metadata wajib untuk setiap stage EMG; metadata stage tidak dapat diubah setelah sampel pertama diterima.
 - Idempotent batch ingest dengan `message_id` + checksum unique constraint.
 - Receipt/ACK hanya setelah commit.
 - Batas ukuran payload dan backpressure.
