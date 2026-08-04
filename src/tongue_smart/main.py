@@ -1,11 +1,14 @@
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+import hashlib
+import hmac
+import json
 import os
 from typing import Annotated, Literal
 from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -14,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, ExaminationSessionRecord, RefreshSessionRecord, RegistrationRequestRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, ExaminationSessionRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -122,6 +125,24 @@ class ExaminationSessionCreate(BaseModel):
     electrode_site_note: str | None = Field(default=None, max_length=240)
 
 
+class MeasurementSample(BaseModel):
+    timestamp: datetime
+    protocol_stage: str = Field(min_length=1, max_length=64)
+    sensor_channel: str = Field(min_length=1, max_length=64)
+    raw_value: float
+    calibrated_value: float | None = None
+    measurement_unit: str = Field(min_length=1, max_length=16)
+    signal_quality: Literal["good", "fair", "poor", "invalid"] = "good"
+
+
+class SampleBatchIngest(BaseModel):
+    message_id: str = Field(min_length=1, max_length=96)
+    device_id: str = Field(min_length=1, max_length=64)
+    sequence: int = Field(ge=0)
+    checksum: str = Field(min_length=64, max_length=64, pattern=r"^[a-fA-F0-9]{64}$")
+    samples: list[MeasurementSample] = Field(min_length=1, max_length=500)
+
+
 class DeviceEvent(BaseModel):
     schema_version: int = Field(default=1, ge=1)
     message_id: str = Field(min_length=1, max_length=96)
@@ -211,6 +232,14 @@ def require_roles(*roles: Role):
             raise HTTPException(status_code=403, detail="Insufficient permission")
         return user
     return dependency
+
+
+def require_device_key(x_device_key: Annotated[str | None, Header()] = None) -> None:
+    expected = os.getenv("TONGUE_SMART_DEVICE_API_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Device ingest is not configured")
+    if not x_device_key or not hmac.compare_digest(x_device_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid device credential")
 
 
 CAPABILITIES = {
@@ -437,8 +466,8 @@ def dashboard_summary(
     device = device_snapshot(db)
     return {
         "device_status": device["connection"],
-        "pending_sync": 0,
-        "completed_sessions": 0,
+        "pending_sync": db.scalar(select(func.count()).select_from(ExaminationSessionRecord).where(ExaminationSessionRecord.status.in_(["prepared", "active"]))) or 0,
+        "completed_sessions": db.scalar(select(func.count()).select_from(ExaminationSessionRecord).where(ExaminationSessionRecord.status == "completed")) or 0,
         "subject_count": db.scalar(select(func.count()).select_from(SubjectRecord).where(SubjectRecord.is_active.is_(True))) or 0,
         "last_calibration": None,
         "generated_at": datetime.now(UTC),
@@ -514,6 +543,77 @@ def create_examination_session(
     add_audit(db, operator.id, "session.prepared", "examination_session", session.id, f"subject={subject.subject_code}")
     db.commit()
     return examination_view(session, db)
+
+
+@app.post("/api/v1/sessions/{session_id}/start", tags=["sessions"])
+def start_examination_session(
+    session_id: str,
+    operator: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(ExaminationSessionRecord, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    if session.status != "prepared":
+        raise HTTPException(status_code=409, detail="Hanya sesi prepared yang dapat dimulai")
+    session.status = "active"
+    session.started_at = datetime.now(UTC)
+    add_audit(db, operator.id, "session.started", "examination_session", session.id)
+    db.commit()
+    return examination_view(session, db)
+
+
+@app.post("/api/v1/sessions/{session_id}/finalize", tags=["sessions"])
+def finalize_examination_session(
+    session_id: str,
+    operator: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(ExaminationSessionRecord, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    if session.status != "active":
+        raise HTTPException(status_code=409, detail="Hanya sesi aktif yang dapat diselesaikan")
+    session.status = "completed"
+    session.completed_at = datetime.now(UTC)
+    add_audit(db, operator.id, "session.completed", "examination_session", session.id)
+    db.commit()
+    return examination_view(session, db)
+
+
+@app.post("/api/v1/sessions/{session_id}/batches", status_code=202, tags=["ingest"])
+def ingest_sample_batch(
+    session_id: str,
+    payload: SampleBatchIngest,
+    _: None = Depends(require_device_key),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(ExaminationSessionRecord, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    if session.status != "active":
+        raise HTTPException(status_code=409, detail="Sesi belum aktif atau sudah selesai")
+    if payload.device_id != session.device_id:
+        raise HTTPException(status_code=409, detail="Device tidak sesuai dengan sesi")
+    sample_data = [sample.model_dump(mode="json") for sample in payload.samples]
+    computed = hashlib.sha256(json.dumps(sample_data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if not hmac.compare_digest(computed, payload.checksum.lower()):
+        raise HTTPException(status_code=422, detail="Checksum batch tidak valid")
+    existing = db.scalar(select(SampleBatchRecord).where(SampleBatchRecord.device_id == payload.device_id, SampleBatchRecord.message_id == payload.message_id))
+    if existing:
+        if existing.checksum != computed or existing.session_id != session_id:
+            raise HTTPException(status_code=409, detail="message_id telah digunakan untuk payload berbeda")
+        return {"receipt_id": existing.id, "duplicate": True, "sequence": existing.sequence, "received_at": existing.received_at}
+    record = SampleBatchRecord(id=str(uuid4()), session_id=session_id, device_id=payload.device_id,
+                               message_id=payload.message_id, sequence=payload.sequence, checksum=computed,
+                               samples=sample_data, received_at=datetime.now(UTC))
+    db.add(record)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Sequence batch sudah diterima") from exc
+    return {"receipt_id": record.id, "duplicate": False, "sequence": record.sequence, "received_at": record.received_at}
 
 
 @app.post("/api/v1/device-events", status_code=status.HTTP_202_ACCEPTED, tags=["devices"])

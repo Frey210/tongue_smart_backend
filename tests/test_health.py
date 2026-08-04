@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 from datetime import UTC, datetime
+import hashlib
+import json
 from uuid import uuid4
 
 from tongue_smart.database import SessionLocal
@@ -152,3 +154,28 @@ def test_prepare_examination_session_validates_consent_and_emg_site() -> None:
         assert created.json()["status"] == "prepared"
         assert created.json()["electrode_site"] == "masseter_left"
         assert any(item["id"] == created.json()["id"] for item in client.get("/api/v1/sessions", headers=headers).json())
+
+
+def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
+    monkeypatch.setenv("TONGUE_SMART_DEVICE_API_KEY", "test-device-key")
+    operator_email = f"operator-{uuid4()}@example.test"
+    with TestClient(app) as client:
+        create_test_user("operator", operator_email)
+        login = client.post("/api/v1/auth/login", json={"email": operator_email, "password": "valid-password-123"}).json()
+        headers = {"Authorization": f"Bearer {login['access_token']}"}
+        subject = client.post("/api/v1/subjects", headers=headers, json={
+            "subject_code": f"TS-{uuid4().hex[:8]}", "initials": "BT", "research_group": "Pilot", "consent_status": "granted",
+        }).json()
+        session = client.post("/api/v1/sessions", headers=headers, json={
+            "subject_id": subject["id"], "device_id": "tongue-smart-v3", "modules": ["tongue_pressure"], "protocol_stages": ["tongue_press"],
+        }).json()
+        assert client.post(f"/api/v1/sessions/{session['id']}/start", headers=headers).json()["status"] == "active"
+        samples = [{"timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"), "protocol_stage": "tongue_press", "sensor_channel": "fsr_1", "raw_value": 1042.0, "calibrated_value": 12.4, "measurement_unit": "kPa", "signal_quality": "good"}]
+        checksum = hashlib.sha256(json.dumps(samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        batch = {"message_id": f"batch-{uuid4()}", "device_id": "tongue-smart-v3", "sequence": 0, "checksum": checksum, "samples": samples}
+        device_headers = {"X-Device-Key": "test-device-key"}
+        first = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
+        duplicate = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
+        assert first.status_code == 202 and first.json()["duplicate"] is False
+        assert duplicate.status_code == 202 and duplicate.json()["duplicate"] is True
+        assert client.post(f"/api/v1/sessions/{session['id']}/finalize", headers=headers).json()["status"] == "completed"

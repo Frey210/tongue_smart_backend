@@ -102,3 +102,20 @@ class ExaminationSessionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SampleBatchRecord(Base):
+    __tablename__ = "sample_batches"
+    __table_args__ = (
+        UniqueConstraint("device_id", "message_id", name="uq_sample_batch_device_message"),
+        UniqueConstraint("session_id", "sequence", name="uq_sample_batch_session_sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("examination_sessions.id"), index=True)
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
+    message_id: Mapped[str] = mapped_column(String(96))
+    sequence: Mapped[int] = mapped_column(Integer)
+    checksum: Mapped[str] = mapped_column(String(64))
+    samples: Mapped[list[dict[str, object]]] = mapped_column(JSON)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
