@@ -174,10 +174,13 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         checksum = hashlib.sha256(json.dumps(samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         batch = {"message_id": f"batch-{uuid4()}", "device_id": "tongue-smart-v3", "sequence": 0, "checksum": checksum, "samples": samples}
         device_headers = {"X-Device-Key": "test-device-key"}
+        active = client.get("/api/v1/device/sessions/active?device_id=tongue-smart-v3", headers=device_headers)
+        assert active.status_code == 200 and active.json()[0]["next_sequence"] == 0
         first = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
         duplicate = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
         assert first.status_code == 202 and first.json()["duplicate"] is False
         assert duplicate.status_code == 202 and duplicate.json()["duplicate"] is True
+        assert client.get("/api/v1/device/sessions/active?device_id=tongue-smart-v3", headers=device_headers).json()[0]["next_sequence"] == 1
         marker = client.post(f"/api/v1/sessions/{session['id']}/markers", headers=headers, json={
             "protocol_stage": "tongue_press", "label": "Tekanan puncak", "occurred_at": samples[0]["timestamp"],
         })

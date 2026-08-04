@@ -635,6 +635,25 @@ def ingest_sample_batch(
     return {"receipt_id": record.id, "duplicate": False, "sequence": record.sequence, "received_at": record.received_at}
 
 
+@app.get("/api/v1/device/sessions/active", tags=["ingest"])
+def active_device_sessions(
+    device_id: str = Query(min_length=1, max_length=64),
+    _: None = Depends(require_device_key),
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    records = db.scalars(select(ExaminationSessionRecord).where(
+        ExaminationSessionRecord.device_id == device_id,
+        ExaminationSessionRecord.status == "active",
+    ).order_by(ExaminationSessionRecord.started_at)).all()
+    result = []
+    for record in records:
+        last_sequence = db.scalar(select(func.max(SampleBatchRecord.sequence)).where(SampleBatchRecord.session_id == record.id))
+        item = examination_view(record, db)
+        item["next_sequence"] = 0 if last_sequence is None else last_sequence + 1
+        result.append(item)
+    return result
+
+
 @app.get("/api/v1/sessions/{session_id}/results", tags=["results"])
 def session_results(
     session_id: str,

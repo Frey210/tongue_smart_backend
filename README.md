@@ -14,6 +14,17 @@ Content-Type: application/json
 
 Secret perangkat dibaca dari `TONGUE_SMART_DEVICE_API_KEY`; jangan hard-code secret ke repository.
 
+## Simulator perangkat Python
+
+Simulator ESP tersedia di `tools/device_simulator.py` dan hanya memakai Python standard library. Buat sesi dari dashboard, tandai sebagai `active`, lalu jalankan:
+
+```powershell
+$env:TONGUE_SMART_DEVICE_API_KEY = "<lihat credentials.md lokal>"
+python tools/device_simulator.py --duration 30 --sample-rate 10
+```
+
+Simulator mencari sesi aktif, menghasilkan data sesuai modul sesi, mengirim batch ber-checksum, melanjutkan sequence terakhir, dan melakukan retry eksponensial. Gunakan `--help` untuk opsi session, batch, seed, base URL, dan dry-run.
+
 FastAPI foundation untuk sinkronisasi dan data riset. Pengukuran tidak bergantung pada backend.
 
 ```powershell

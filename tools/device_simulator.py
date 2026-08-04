@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Tongue Smart ESP device simulator using only the Python standard library."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import UTC, datetime
+import getpass
+import hashlib
+import json
+import math
+import os
+import random
+import signal
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+
+CHANNELS = {
+    "emg": ("emg_1", "uV"),
+    "tongue_pressure": ("fsr_1", "kPa"),
+    "lip_force": ("lip_force_1", "N"),
+}
+
+
+class DeviceClient:
+    def __init__(self, base_url: str, device_id: str, api_key: str, timeout: float = 15.0):
+        self.base_url = base_url.rstrip("/")
+        self.device_id = device_id
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def request(self, method: str, path: str, body: dict | None = None) -> dict | list:
+        data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
+        request = Request(self.base_url + path, data=data, method=method, headers={
+            "Accept": "application/json", "Content-Type": "application/json", "X-Device-Key": self.api_key,
+            "User-Agent": "TongueSmart-DeviceSimulator/1.0",
+        })
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                payload = response.read()
+                return json.loads(payload) if payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Network error: {exc.reason}") from exc
+
+    def active_sessions(self) -> list[dict]:
+        query = urlencode({"device_id": self.device_id})
+        return self.request("GET", f"/device/sessions/active?{query}")  # type: ignore[return-value]
+
+    def send_batch(self, session_id: str, sequence: int, samples: list[dict]) -> dict:
+        canonical = json.dumps(samples, sort_keys=True, separators=(",", ":"))
+        body = {"message_id": f"sim-{self.device_id}-{uuid4()}", "device_id": self.device_id,
+                "sequence": sequence, "checksum": hashlib.sha256(canonical.encode()).hexdigest(), "samples": samples}
+        return self.request("POST", f"/sessions/{session_id}/batches", body)  # type: ignore[return-value]
+
+
+def sample_value(module: str, elapsed: float, rng: random.Random) -> tuple[float, float]:
+    if module == "emg":
+        calibrated = max(0.0, 85 + 45 * math.sin(elapsed * 7.0) + rng.gauss(0, 9))
+        return calibrated * 3.2, calibrated
+    if module == "tongue_pressure":
+        calibrated = max(0.0, 13 + 10 * math.sin(elapsed * 1.4) + rng.gauss(0, 0.8))
+        return 620 + calibrated * 34, calibrated
+    calibrated = max(0.0, 5.5 + 4 * math.sin(elapsed * 0.8) + rng.gauss(0, 0.25))
+    return calibrated * 910, calibrated
+
+
+def make_samples(session: dict, start_index: int, count: int, sample_rate: float, rng: random.Random) -> list[dict]:
+    modules = [module for module in session["modules"] if module in CHANNELS]
+    stages = session.get("protocol_stages") or ["unspecified"]
+    started = time.time()
+    samples = []
+    for offset in range(count):
+        index = start_index + offset
+        elapsed = index / sample_rate
+        timestamp = datetime.fromtimestamp(started + offset / sample_rate, UTC).isoformat().replace("+00:00", "Z")
+        stage = stages[min(len(stages) - 1, int(elapsed // 10) % len(stages))]
+        for module in modules:
+            channel, unit = CHANNELS[module]
+            raw, calibrated = sample_value(module, elapsed, rng)
+            samples.append({"timestamp": timestamp, "protocol_stage": stage, "sensor_channel": channel,
+                            "raw_value": round(raw, 4), "calibrated_value": round(calibrated, 4),
+                            "measurement_unit": unit, "signal_quality": "good"})
+    return samples
+
+
+def choose_session(sessions: list[dict], requested_id: str | None) -> dict:
+    if requested_id:
+        match = next((item for item in sessions if item["id"] == requested_id or item["session_code"] == requested_id), None)
+        if not match:
+            raise RuntimeError(f"Active session not found: {requested_id}")
+        return match
+    if len(sessions) == 1:
+        return sessions[0]
+    print("Active sessions:")
+    for index, item in enumerate(sessions, 1):
+        print(f"  {index}. {item['session_code']} | {item['subject_code']} | {', '.join(item['modules'])}")
+    selection = int(input("Select session number: "))
+    return sessions[selection - 1]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Simulate Tongue Smart ESP HTTPS batch ingest")
+    parser.add_argument("--base-url", default="https://tongue-smart.farlabs.my.id/api/v1")
+    parser.add_argument("--device-id", default="tongue-smart-v3")
+    parser.add_argument("--session", help="Active session UUID or session code")
+    parser.add_argument("--duration", type=float, default=30.0, help="Simulation duration in seconds")
+    parser.add_argument("--sample-rate", type=float, default=10.0, help="Samples per channel per second")
+    parser.add_argument("--batch-size", type=int, default=25, help="Time samples per HTTP batch")
+    parser.add_argument("--interval", type=float, default=0.5, help="Delay between batches")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dry-run", action="store_true", help="Print one batch without sending")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.duration <= 0 or args.sample_rate <= 0 or not 1 <= args.batch_size <= 166:
+        raise SystemExit("duration/sample-rate must be positive; batch-size must be 1..166")
+    api_key = os.getenv("TONGUE_SMART_DEVICE_API_KEY") or getpass.getpass("Device API key: ")
+    if not api_key:
+        raise SystemExit("Device API key is required")
+    client = DeviceClient(args.base_url, args.device_id, api_key)
+    sessions = client.active_sessions()
+    if not sessions:
+        print("No active sessions. Prepare and start a session from the dashboard first.")
+        return 2
+    session = choose_session(sessions, args.session)
+    rng = random.Random(args.seed)
+    sequence = int(session["next_sequence"])
+    target = int(args.duration * args.sample_rate)
+    sent = 0
+    stopped = False
+
+    def stop(*_: object) -> None:
+        nonlocal stopped
+        stopped = True
+
+    signal.signal(signal.SIGINT, stop)
+    print(f"Simulating {session['session_code']} ({', '.join(session['modules'])}), sequence starts at {sequence}")
+    while sent < target and not stopped:
+        count = min(args.batch_size, target - sent)
+        samples = make_samples(session, sent, count, args.sample_rate, rng)
+        if args.dry_run:
+            print(json.dumps(samples[: min(3, len(samples))], indent=2))
+            return 0
+        for attempt in range(1, 4):
+            try:
+                receipt = client.send_batch(session["id"], sequence, samples)
+                print(f"ACK seq={receipt['sequence']} receipt={receipt['receipt_id']} duplicate={receipt['duplicate']}")
+                sequence += 1
+                sent += count
+                break
+            except RuntimeError as exc:
+                if attempt == 3:
+                    print(f"Batch failed after 3 attempts: {exc}", file=sys.stderr)
+                    return 1
+                delay = 2 ** (attempt - 1)
+                print(f"Retry {attempt}/3 in {delay}s: {exc}", file=sys.stderr)
+                time.sleep(delay)
+        time.sleep(max(0, args.interval))
+    print(f"Done. Generated {sent} time samples across {len(session['modules'])} module(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
