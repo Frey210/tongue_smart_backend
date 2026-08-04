@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -56,3 +56,31 @@ class RegistrationRequestRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+
+class SubjectRecord(Base):
+    __tablename__ = "subjects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    subject_code: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    initials: Mapped[str] = mapped_column(String(12))
+    research_group: Mapped[str] = mapped_column(String(80), index=True)
+    year_of_birth: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    consent_status: Mapped[str] = mapped_column(String(24), index=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+
+
+class AuditEventRecord(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    entity_type: Mapped[str] = mapped_column(String(32), index=True)
+    entity_id: Mapped[str] = mapped_column(String(36), index=True)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

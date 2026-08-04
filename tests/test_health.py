@@ -107,3 +107,29 @@ def test_registration_requires_admin_approval_and_password_can_change() -> None:
         assert client.post("/api/v1/auth/login", json={
             "email": admin_email, "password": "new-password-456",
         }).status_code == 200
+
+
+def test_subject_consent_workflow_and_role_permissions() -> None:
+    operator_email = f"operator-{uuid4()}@example.test"
+    researcher_email = f"researcher-{uuid4()}@example.test"
+    with TestClient(app) as client:
+        create_test_user("operator", operator_email)
+        create_test_user("researcher", researcher_email)
+        operator = client.post("/api/v1/auth/login", json={"email": operator_email, "password": "valid-password-123"}).json()
+        researcher = client.post("/api/v1/auth/login", json={"email": researcher_email, "password": "valid-password-123"}).json()
+        operator_headers = {"Authorization": f"Bearer {operator['access_token']}"}
+        researcher_headers = {"Authorization": f"Bearer {researcher['access_token']}"}
+        code = f"TS-{uuid4().hex[:8]}"
+        created = client.post("/api/v1/subjects", headers=operator_headers, json={
+            "subject_code": code, "initials": "AN", "research_group": "Control",
+            "year_of_birth": 2015, "consent_status": "pending", "notes": "No direct identity",
+        })
+        assert created.status_code == 201
+        subject_id = created.json()["id"]
+        assert client.get("/api/v1/subjects?consent_status=pending", headers=researcher_headers).json()[0]["subject_code"] == code.upper()
+        assert client.post("/api/v1/subjects", headers=researcher_headers, json={
+            "subject_code": "DENIED", "initials": "XX", "research_group": "Control", "consent_status": "pending",
+        }).status_code == 403
+        updated = client.patch(f"/api/v1/subjects/{subject_id}", headers=operator_headers, json={"consent_status": "granted"})
+        assert updated.status_code == 200
+        assert updated.json()["consent_status"] == "granted"

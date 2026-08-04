@@ -5,16 +5,16 @@ from typing import Annotated, Literal
 from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import DeviceEventRecord, RefreshSessionRecord, RegistrationRequestRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, RefreshSessionRecord, RegistrationRequestRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -55,7 +55,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
@@ -88,6 +88,27 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=10, max_length=128)
 
 
+ConsentStatus = Literal["pending", "granted", "withdrawn"]
+
+
+class SubjectCreate(BaseModel):
+    subject_code: str = Field(min_length=2, max_length=48, pattern=r"^[A-Za-z0-9_-]+$")
+    initials: str = Field(min_length=1, max_length=12)
+    research_group: str = Field(min_length=2, max_length=80)
+    year_of_birth: int | None = Field(default=None, ge=1900, le=datetime.now(UTC).year)
+    consent_status: ConsentStatus
+    notes: str = Field(default="", max_length=2000)
+
+
+class SubjectUpdate(BaseModel):
+    initials: str | None = Field(default=None, min_length=1, max_length=12)
+    research_group: str | None = Field(default=None, min_length=2, max_length=80)
+    year_of_birth: int | None = Field(default=None, ge=1900, le=datetime.now(UTC).year)
+    consent_status: ConsentStatus | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+    is_active: bool | None = None
+
+
 class DeviceEvent(BaseModel):
     schema_version: int = Field(default=1, ge=1)
     message_id: str = Field(min_length=1, max_length=96)
@@ -111,6 +132,20 @@ def registration_view(request: RegistrationRequestRecord) -> dict[str, object]:
         "institution": request.institution, "status": request.status,
         "created_at": request.created_at,
     }
+
+
+def subject_view(subject: SubjectRecord) -> dict[str, object]:
+    return {
+        "id": subject.id, "subject_code": subject.subject_code, "initials": subject.initials,
+        "research_group": subject.research_group, "year_of_birth": subject.year_of_birth,
+        "consent_status": subject.consent_status, "notes": subject.notes,
+        "is_active": subject.is_active, "created_at": subject.created_at, "updated_at": subject.updated_at,
+    }
+
+
+def add_audit(db: Session, actor_id: str, action: str, entity_type: str, entity_id: str, detail: str = "") -> None:
+    db.add(AuditEventRecord(id=str(uuid4()), actor_id=actor_id, action=action, entity_type=entity_type,
+                            entity_id=entity_id, detail=detail, created_at=datetime.now(UTC)))
 
 
 def issue_session(user: UserRecord, db: Session) -> dict[str, object]:
@@ -310,6 +345,63 @@ def ready() -> dict[str, str]:
     return {"status": "ready"}
 
 
+@app.get("/api/v1/subjects", tags=["subjects"])
+def list_subjects(
+    search: str = Query(default="", max_length=80),
+    consent_status: ConsentStatus | None = None,
+    _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    statement = select(SubjectRecord).order_by(desc(SubjectRecord.created_at))
+    if search.strip():
+        term = f"%{search.strip()}%"
+        statement = statement.where(or_(SubjectRecord.subject_code.ilike(term), SubjectRecord.initials.ilike(term), SubjectRecord.research_group.ilike(term)))
+    if consent_status:
+        statement = statement.where(SubjectRecord.consent_status == consent_status)
+    return [subject_view(subject) for subject in db.scalars(statement).all()]
+
+
+@app.post("/api/v1/subjects", status_code=201, tags=["subjects"])
+def create_subject(
+    payload: SubjectCreate,
+    actor: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    code = payload.subject_code.strip().upper()
+    if db.scalar(select(SubjectRecord).where(SubjectRecord.subject_code == code)):
+        raise HTTPException(status_code=409, detail="Kode subjek sudah digunakan")
+    now = datetime.now(UTC)
+    subject = SubjectRecord(id=str(uuid4()), subject_code=code, initials=payload.initials.strip().upper(),
+                            research_group=payload.research_group.strip(), year_of_birth=payload.year_of_birth,
+                            consent_status=payload.consent_status, notes=payload.notes.strip(), is_active=True,
+                            created_at=now, updated_at=now, created_by=actor.id)
+    db.add(subject)
+    add_audit(db, actor.id, "subject.created", "subject", subject.id, f"consent={subject.consent_status}")
+    db.commit()
+    return subject_view(subject)
+
+
+@app.patch("/api/v1/subjects/{subject_id}", tags=["subjects"])
+def update_subject(
+    subject_id: str,
+    payload: SubjectUpdate,
+    actor: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    subject = db.get(SubjectRecord, subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="Subjek tidak ditemukan")
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        if isinstance(value, str): value = value.strip()
+        if field == "initials" and isinstance(value, str): value = value.upper()
+        setattr(subject, field, value)
+    subject.updated_at = datetime.now(UTC)
+    add_audit(db, actor.id, "subject.updated", "subject", subject.id, ",".join(sorted(changes)))
+    db.commit()
+    return subject_view(subject)
+
+
 @app.get("/api/v1/dashboard/summary", tags=["dashboard"])
 def dashboard_summary(
     _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
@@ -320,6 +412,7 @@ def dashboard_summary(
         "device_status": device["connection"],
         "pending_sync": 0,
         "completed_sessions": 0,
+        "subject_count": db.scalar(select(func.count()).select_from(SubjectRecord).where(SubjectRecord.is_active.is_(True))) or 0,
         "last_calibration": None,
         "generated_at": datetime.now(UTC),
     }
