@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tongue-smart-backend"
+version = "0.1.0"
+description = "Offline-first synchronization backend for Tongue Smart v3"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.141,<0.142",
+  "uvicorn[standard]>=0.52,<0.53",
+]
+
+[project.optional-dependencies]
+dev = ["httpx>=0.28", "pytest>=9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tongue_smart"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
