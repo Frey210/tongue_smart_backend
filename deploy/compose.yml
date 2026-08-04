@@ -4,12 +4,17 @@ services:
       context: ..
     restart: unless-stopped
     environment:
-      TONGUE_SMART_DATABASE_URL: "${TONGUE_SMART_DATABASE_URL:?set database URL in deploy/.env}"
+      TONGUE_SMART_DATABASE_URL: "${TONGUE_SMART_DATABASE_URL:-sqlite+pysqlite:////data/tongue_smart.db}"
+    volumes:
+      - backend_data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  backend_data:
 
   frontend:
     build:
