@@ -71,3 +71,39 @@ def test_login_refresh_and_role_protection() -> None:
         assert client.post("/api/v1/auth/refresh", json={
             "refresh_token": tokens["refresh_token"],
         }).status_code == 401
+
+
+def test_registration_requires_admin_approval_and_password_can_change() -> None:
+    admin_email = f"admin-{uuid4()}@example.test"
+    applicant_email = f"applicant-{uuid4()}@example.test"
+    with TestClient(app) as client:
+        create_test_user("admin", admin_email)
+        registration = client.post("/api/v1/auth/register", json={
+            "email": applicant_email, "full_name": "New Operator",
+            "institution": "FKG Research Lab", "password": "applicant-password-123",
+        })
+        assert registration.status_code == 202
+        assert client.post("/api/v1/auth/login", json={
+            "email": applicant_email, "password": "applicant-password-123",
+        }).status_code == 401
+
+        admin_login = client.post("/api/v1/auth/login", json={
+            "email": admin_email, "password": "valid-password-123",
+        }).json()
+        headers = {"Authorization": f"Bearer {admin_login['access_token']}"}
+        requests = client.get("/api/v1/registration-requests", headers=headers).json()
+        request = next(item for item in requests if item["email"] == applicant_email)
+        assert client.post(
+            f"/api/v1/registration-requests/{request['id']}/approve", headers=headers
+        ).status_code == 200
+        assert client.post("/api/v1/auth/login", json={
+            "email": applicant_email, "password": "applicant-password-123",
+        }).status_code == 200
+
+        changed = client.post("/api/v1/auth/change-password", headers=headers, json={
+            "current_password": "valid-password-123", "new_password": "new-password-456",
+        })
+        assert changed.status_code == 204
+        assert client.post("/api/v1/auth/login", json={
+            "email": admin_email, "password": "new-password-456",
+        }).status_code == 200

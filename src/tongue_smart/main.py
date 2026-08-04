@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import DeviceEventRecord, RefreshSessionRecord, UserRecord
+from .models import DeviceEventRecord, RefreshSessionRecord, RegistrationRequestRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -76,6 +76,18 @@ class UserCreate(BaseModel):
     password: str = Field(min_length=10, max_length=128)
 
 
+class RegistrationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    full_name: str = Field(min_length=2, max_length=120)
+    institution: str = Field(min_length=2, max_length=160)
+    password: str = Field(min_length=10, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=10, max_length=128)
+    new_password: str = Field(min_length=10, max_length=128)
+
+
 class DeviceEvent(BaseModel):
     schema_version: int = Field(default=1, ge=1)
     message_id: str = Field(min_length=1, max_length=96)
@@ -90,6 +102,14 @@ def user_view(user: UserRecord) -> dict[str, object]:
     return {
         "id": user.id, "email": user.email, "full_name": user.full_name,
         "role": user.role, "is_active": user.is_active,
+    }
+
+
+def registration_view(request: RegistrationRequestRecord) -> dict[str, object]:
+    return {
+        "id": request.id, "email": request.email, "full_name": request.full_name,
+        "institution": request.institution, "status": request.status,
+        "created_at": request.created_at,
     }
 
 
@@ -154,6 +174,26 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, obj
     return issue_session(user, db)
 
 
+@app.post("/api/v1/auth/register", status_code=202, tags=["auth"])
+def register(payload: RegistrationRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+    email = payload.email.strip().lower()
+    if db.scalar(select(UserRecord).where(UserRecord.email == email)):
+        raise HTTPException(status_code=409, detail="Email sudah terdaftar")
+    existing = db.scalar(select(RegistrationRequestRecord).where(
+        RegistrationRequestRecord.email == email
+    ))
+    if existing:
+        raise HTTPException(status_code=409, detail="Permintaan pendaftaran sudah dikirim")
+    request = RegistrationRequestRecord(
+        id=str(uuid4()), email=email, full_name=payload.full_name.strip(),
+        institution=payload.institution.strip(), password_hash=hash_password(payload.password),
+        status="pending", created_at=datetime.now(UTC), reviewed_at=None, reviewed_by=None,
+    )
+    db.add(request)
+    db.commit()
+    return {"accepted": True, "status": "pending_approval"}
+
+
 @app.post("/api/v1/auth/refresh", tags=["auth"])
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)) -> dict[str, object]:
     session = db.scalar(select(RefreshSessionRecord).where(
@@ -188,6 +228,21 @@ def me(user: UserRecord = Depends(get_current_user)) -> dict[str, object]:
     return user_view(user)
 
 
+@app.post("/api/v1/auth/change-password", status_code=204, tags=["auth"])
+def change_password(
+    payload: ChangePasswordRequest, user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Password saat ini tidak valid")
+    user.password_hash = hash_password(payload.new_password)
+    db.query(RefreshSessionRecord).filter(
+        RefreshSessionRecord.user_id == user.id,
+        RefreshSessionRecord.revoked_at.is_(None),
+    ).update({"revoked_at": datetime.now(UTC)})
+    db.commit()
+
+
 @app.get("/api/v1/users", tags=["users"])
 def list_users(
     _: UserRecord = Depends(require_roles("admin")), db: Session = Depends(get_db)
@@ -211,6 +266,38 @@ def create_user(
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="Email sudah terdaftar") from exc
+    return user_view(user)
+
+
+@app.get("/api/v1/registration-requests", tags=["users"])
+def list_registration_requests(
+    _: UserRecord = Depends(require_roles("admin")), db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    requests = db.scalars(select(RegistrationRequestRecord).where(
+        RegistrationRequestRecord.status == "pending"
+    ).order_by(RegistrationRequestRecord.created_at)).all()
+    return [registration_view(request) for request in requests]
+
+
+@app.post("/api/v1/registration-requests/{request_id}/approve", tags=["users"])
+def approve_registration(
+    request_id: str, admin: UserRecord = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    request = db.get(RegistrationRequestRecord, request_id)
+    if request is None or request.status != "pending":
+        raise HTTPException(status_code=404, detail="Permintaan tidak ditemukan")
+    if db.scalar(select(UserRecord).where(UserRecord.email == request.email)):
+        raise HTTPException(status_code=409, detail="Email sudah terdaftar")
+    user = UserRecord(
+        id=str(uuid4()), email=request.email, full_name=request.full_name, role="operator",
+        password_hash=request.password_hash, is_active=True, created_at=datetime.now(UTC),
+    )
+    request.status = "approved"
+    request.reviewed_at = datetime.now(UTC)
+    request.reviewed_by = admin.id
+    db.add(user)
+    db.commit()
     return user_view(user)
 
 @app.get("/health", tags=["system"])
