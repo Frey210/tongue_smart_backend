@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, ExaminationSessionRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, EventMarkerRecord, ExaminationSessionRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -141,6 +141,16 @@ class SampleBatchIngest(BaseModel):
     sequence: int = Field(ge=0)
     checksum: str = Field(min_length=64, max_length=64, pattern=r"^[a-fA-F0-9]{64}$")
     samples: list[MeasurementSample] = Field(min_length=1, max_length=500)
+
+
+class EventMarkerCreate(BaseModel):
+    protocol_stage: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=120)
+    occurred_at: datetime
+
+
+class OperatorNoteCreate(BaseModel):
+    note: str = Field(min_length=1, max_length=2000)
 
 
 class DeviceEvent(BaseModel):
@@ -614,6 +624,77 @@ def ingest_sample_batch(
         db.rollback()
         raise HTTPException(status_code=409, detail="Sequence batch sudah diterima") from exc
     return {"receipt_id": record.id, "duplicate": False, "sequence": record.sequence, "received_at": record.received_at}
+
+
+@app.get("/api/v1/sessions/{session_id}/results", tags=["results"])
+def session_results(
+    session_id: str,
+    sensor_channel: str | None = Query(default=None, max_length=64),
+    max_points: int = Query(default=300, ge=10, le=1000),
+    _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(ExaminationSessionRecord, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    batches = db.scalars(select(SampleBatchRecord).where(SampleBatchRecord.session_id == session_id).order_by(SampleBatchRecord.sequence)).all()
+    samples = [sample for batch in batches for sample in batch.samples if not sensor_channel or sample.get("sensor_channel") == sensor_channel]
+    channels = sorted({str(sample.get("sensor_channel")) for batch in batches for sample in batch.samples})
+    stride = max(1, (len(samples) + max_points - 1) // max_points)
+    points = samples[::stride]
+    values = [float(sample["calibrated_value"] if sample.get("calibrated_value") is not None else sample["raw_value"]) for sample in samples]
+    quality = {name: sum(1 for sample in samples if sample.get("signal_quality") == name) for name in ("good", "fair", "poor", "invalid")}
+    markers = db.scalars(select(EventMarkerRecord).where(EventMarkerRecord.session_id == session_id).order_by(EventMarkerRecord.occurred_at)).all()
+    notes = db.scalars(select(OperatorNoteRecord).where(OperatorNoteRecord.session_id == session_id).order_by(desc(OperatorNoteRecord.created_at))).all()
+    return {
+        "session": examination_view(session, db), "channels": channels, "selected_channel": sensor_channel,
+        "sample_count": len(samples), "batch_count": len(batches), "downsample_stride": stride,
+        "summary": {"minimum": min(values) if values else None, "maximum": max(values) if values else None,
+                    "average": sum(values) / len(values) if values else None, "quality": quality},
+        "points": [{"timestamp": sample.get("timestamp"), "protocol_stage": sample.get("protocol_stage"),
+                    "sensor_channel": sample.get("sensor_channel"),
+                    "value": sample.get("calibrated_value") if sample.get("calibrated_value") is not None else sample.get("raw_value"),
+                    "unit": sample.get("measurement_unit"), "quality": sample.get("signal_quality")} for sample in points],
+        "markers": [{"id": marker.id, "protocol_stage": marker.protocol_stage, "label": marker.label,
+                     "occurred_at": marker.occurred_at} for marker in markers],
+        "notes": [{"id": note.id, "actor_id": note.actor_id, "note": note.note, "created_at": note.created_at} for note in notes],
+    }
+
+
+@app.post("/api/v1/sessions/{session_id}/markers", status_code=201, tags=["results"])
+def create_event_marker(
+    session_id: str,
+    payload: EventMarkerCreate,
+    actor: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(ExaminationSessionRecord, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    marker = EventMarkerRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
+                               protocol_stage=payload.protocol_stage, label=payload.label.strip(),
+                               occurred_at=payload.occurred_at, created_at=datetime.now(UTC))
+    db.add(marker)
+    add_audit(db, actor.id, "marker.created", "examination_session", session_id, marker.label)
+    db.commit()
+    return {"id": marker.id, "protocol_stage": marker.protocol_stage, "label": marker.label, "occurred_at": marker.occurred_at}
+
+
+@app.post("/api/v1/sessions/{session_id}/notes", status_code=201, tags=["results"])
+def create_operator_note(
+    session_id: str,
+    payload: OperatorNoteCreate,
+    actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    if db.get(ExaminationSessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    note = OperatorNoteRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
+                              note=payload.note.strip(), created_at=datetime.now(UTC))
+    db.add(note)
+    add_audit(db, actor.id, "note.created", "examination_session", session_id)
+    db.commit()
+    return {"id": note.id, "actor_id": note.actor_id, "note": note.note, "created_at": note.created_at}
 
 
 @app.post("/api/v1/device-events", status_code=status.HTTP_202_ACCEPTED, tags=["devices"])

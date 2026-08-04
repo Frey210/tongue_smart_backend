@@ -178,4 +178,14 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         duplicate = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
         assert first.status_code == 202 and first.json()["duplicate"] is False
         assert duplicate.status_code == 202 and duplicate.json()["duplicate"] is True
+        marker = client.post(f"/api/v1/sessions/{session['id']}/markers", headers=headers, json={
+            "protocol_stage": "tongue_press", "label": "Tekanan puncak", "occurred_at": samples[0]["timestamp"],
+        })
+        note = client.post(f"/api/v1/sessions/{session['id']}/notes", headers=headers, json={"note": "Sinyal stabil."})
+        assert marker.status_code == 201 and note.status_code == 201
+        results = client.get(f"/api/v1/sessions/{session['id']}/results?sensor_channel=fsr_1", headers=headers).json()
+        assert results["sample_count"] == 1
+        assert results["summary"]["maximum"] == 12.4
+        assert results["markers"][0]["label"] == "Tekanan puncak"
+        assert results["notes"][0]["note"] == "Sinyal stabil."
         assert client.post(f"/api/v1/sessions/{session['id']}/finalize", headers=headers).json()["status"] == "completed"
