@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, RefreshSessionRecord, RegistrationRequestRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, ExaminationSessionRecord, RefreshSessionRecord, RegistrationRequestRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -109,6 +109,19 @@ class SubjectUpdate(BaseModel):
     is_active: bool | None = None
 
 
+MeasurementModule = Literal["emg", "tongue_pressure", "lip_force"]
+ElectrodeSite = Literal["masseter_left", "masseter_right", "temporalis_left", "temporalis_right", "other"]
+
+
+class ExaminationSessionCreate(BaseModel):
+    subject_id: str = Field(min_length=36, max_length=36)
+    device_id: str = Field(min_length=1, max_length=64)
+    modules: list[MeasurementModule] = Field(min_length=1, max_length=3)
+    protocol_stages: list[str] = Field(min_length=1, max_length=12)
+    electrode_site: ElectrodeSite | None = None
+    electrode_site_note: str | None = Field(default=None, max_length=240)
+
+
 class DeviceEvent(BaseModel):
     schema_version: int = Field(default=1, ge=1)
     message_id: str = Field(min_length=1, max_length=96)
@@ -140,6 +153,20 @@ def subject_view(subject: SubjectRecord) -> dict[str, object]:
         "research_group": subject.research_group, "year_of_birth": subject.year_of_birth,
         "consent_status": subject.consent_status, "notes": subject.notes,
         "is_active": subject.is_active, "created_at": subject.created_at, "updated_at": subject.updated_at,
+    }
+
+
+def examination_view(session: ExaminationSessionRecord, db: Session) -> dict[str, object]:
+    subject = db.get(SubjectRecord, session.subject_id)
+    operator = db.get(UserRecord, session.operator_id)
+    return {
+        "id": session.id, "session_code": session.session_code, "subject_id": session.subject_id,
+        "subject_code": subject.subject_code if subject else None,
+        "operator_id": session.operator_id, "operator_name": operator.full_name if operator else None,
+        "device_id": session.device_id, "modules": session.modules, "protocol_stages": session.protocol_stages,
+        "electrode_site": session.electrode_site, "electrode_site_note": session.electrode_site_note,
+        "status": session.status, "created_at": session.created_at, "started_at": session.started_at,
+        "completed_at": session.completed_at,
     }
 
 
@@ -446,8 +473,47 @@ def device_snapshot(db: Session) -> dict[str, object]:
 
 
 @app.get("/api/v1/sessions", tags=["sessions"])
-def sessions(_: UserRecord = Depends(require_roles("admin", "operator", "researcher"))) -> list[object]:
-    return []
+def sessions(
+    _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    records = db.scalars(select(ExaminationSessionRecord).order_by(desc(ExaminationSessionRecord.created_at))).all()
+    return [examination_view(record, db) for record in records]
+
+
+@app.post("/api/v1/sessions", status_code=201, tags=["sessions"])
+def create_examination_session(
+    payload: ExaminationSessionCreate,
+    operator: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    subject = db.get(SubjectRecord, payload.subject_id)
+    if subject is None or not subject.is_active:
+        raise HTTPException(status_code=404, detail="Subjek aktif tidak ditemukan")
+    if subject.consent_status != "granted":
+        raise HTTPException(status_code=409, detail="Consent subjek harus disetujui sebelum membuat sesi")
+    supported = {"emg" if CAPABILITIES["emg_channels"] else "", "tongue_pressure" if CAPABILITIES["tongue_pressure_channels"] else "", "lip_force" if CAPABILITIES["lip_force"] else ""}
+    unsupported = set(payload.modules) - supported
+    if unsupported:
+        raise HTTPException(status_code=422, detail=f"Modul tidak tersedia: {', '.join(sorted(unsupported))}")
+    if "emg" in payload.modules:
+        if payload.electrode_site is None:
+            raise HTTPException(status_code=422, detail="Posisi elektroda wajib untuk modul EMG")
+        if payload.electrode_site == "other" and not (payload.electrode_site_note or "").strip():
+            raise HTTPException(status_code=422, detail="Catatan posisi elektroda wajib untuk pilihan lainnya")
+    now = datetime.now(UTC)
+    session = ExaminationSessionRecord(
+        id=str(uuid4()), session_code=f"SESS-{now.year}-{uuid4().hex[:6].upper()}",
+        subject_id=subject.id, operator_id=operator.id, device_id=payload.device_id,
+        modules=list(dict.fromkeys(payload.modules)), protocol_stages=list(dict.fromkeys(payload.protocol_stages)),
+        electrode_site=payload.electrode_site if "emg" in payload.modules else None,
+        electrode_site_note=(payload.electrode_site_note or "").strip() or None,
+        status="prepared", created_at=now, started_at=None, completed_at=None,
+    )
+    db.add(session)
+    add_audit(db, operator.id, "session.prepared", "examination_session", session.id, f"subject={subject.subject_code}")
+    db.commit()
+    return examination_view(session, db)
 
 
 @app.post("/api/v1/device-events", status_code=status.HTTP_202_ACCEPTED, tags=["devices"])

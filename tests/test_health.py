@@ -133,3 +133,22 @@ def test_subject_consent_workflow_and_role_permissions() -> None:
         updated = client.patch(f"/api/v1/subjects/{subject_id}", headers=operator_headers, json={"consent_status": "granted"})
         assert updated.status_code == 200
         assert updated.json()["consent_status"] == "granted"
+
+
+def test_prepare_examination_session_validates_consent_and_emg_site() -> None:
+    operator_email = f"operator-{uuid4()}@example.test"
+    with TestClient(app) as client:
+        create_test_user("operator", operator_email)
+        login = client.post("/api/v1/auth/login", json={"email": operator_email, "password": "valid-password-123"}).json()
+        headers = {"Authorization": f"Bearer {login['access_token']}"}
+        subject = client.post("/api/v1/subjects", headers=headers, json={
+            "subject_code": f"TS-{uuid4().hex[:8]}", "initials": "EM", "research_group": "Pilot", "consent_status": "granted",
+        }).json()
+        payload = {"subject_id": subject["id"], "device_id": "tongue-smart-v3", "modules": ["emg", "tongue_pressure"], "protocol_stages": ["rest", "clench"]}
+        assert client.post("/api/v1/sessions", headers=headers, json=payload).status_code == 422
+        payload["electrode_site"] = "masseter_left"
+        created = client.post("/api/v1/sessions", headers=headers, json=payload)
+        assert created.status_code == 201
+        assert created.json()["status"] == "prepared"
+        assert created.json()["electrode_site"] == "masseter_left"
+        assert any(item["id"] == created.json()["id"] for item in client.get("/api/v1/sessions", headers=headers).json())

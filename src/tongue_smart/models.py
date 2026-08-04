@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -84,3 +84,21 @@ class AuditEventRecord(Base):
     entity_id: Mapped[str] = mapped_column(String(36), index=True)
     detail: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ExaminationSessionRecord(Base):
+    __tablename__ = "examination_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_code: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    subject_id: Mapped[str] = mapped_column(ForeignKey("subjects.id"), index=True)
+    operator_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
+    modules: Mapped[list[str]] = mapped_column(JSON)
+    protocol_stages: Mapped[list[str]] = mapped_column(JSON)
+    electrode_site: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    electrode_site_note: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="prepared", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
