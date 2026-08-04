@@ -8,6 +8,7 @@ services:
       TONGUE_SMART_JWT_SECRET: "${TONGUE_SMART_JWT_SECRET:?set JWT secret in deploy/.env}"
       TONGUE_SMART_BOOTSTRAP_ADMIN_EMAIL: "${TONGUE_SMART_BOOTSTRAP_ADMIN_EMAIL:-}"
       TONGUE_SMART_BOOTSTRAP_ADMIN_PASSWORD: "${TONGUE_SMART_BOOTSTRAP_ADMIN_PASSWORD:-}"
+      TONGUE_SMART_DEVICE_API_KEY: "${TONGUE_SMART_DEVICE_API_KEY:?set device API key in deploy/.env}"
     volumes:
       - backend_data:/data
     healthcheck:
