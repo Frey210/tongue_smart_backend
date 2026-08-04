@@ -13,6 +13,7 @@ Jalankan dari repository backend:
 ```bash
 cd /opt/tongue-smart/backend/deploy
 cp .env.example .env
+# Ganti password database pada .env sebelum menjalankan container.
 docker compose up -d --build
 ```
 

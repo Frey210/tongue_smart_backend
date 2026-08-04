@@ -1,15 +1,28 @@
 from datetime import UTC, datetime, timedelta
-from threading import Lock
+from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, status
+from fastapi import Depends, FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .database import Base, engine, get_db
+from .models import DeviceEventRecord
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
 
 app = FastAPI(
     title="Tongue Smart API",
     version="0.1.0",
     description="Synchronization and research data API; measurement remains device-local.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -44,10 +57,6 @@ CAPABILITIES = {
     "last_seen_at": None,
 }
 
-DEVICE_EVENTS: dict[tuple[str, str], dict[str, object]] = {}
-EVENT_LOCK = Lock()
-
-
 @app.get("/health", tags=["system"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -59,8 +68,8 @@ def ready() -> dict[str, str]:
 
 
 @app.get("/api/v1/dashboard/summary", tags=["dashboard"])
-def dashboard_summary() -> dict[str, object]:
-    device = current_device()
+def dashboard_summary(db: Session = Depends(get_db)) -> dict[str, object]:
+    device = current_device(db)
     return {
         "device_status": device["connection"],
         "pending_sync": 0,
@@ -71,9 +80,20 @@ def dashboard_summary() -> dict[str, object]:
 
 
 @app.get("/api/v1/devices/current", tags=["devices"])
-def current_device() -> dict[str, object]:
+def current_device(db: Session = Depends(get_db)) -> dict[str, object]:
     device = dict(CAPABILITIES)
-    last_seen = device["last_seen_at"]
+    latest = db.scalar(
+        select(DeviceEventRecord)
+        .where(DeviceEventRecord.device_id == CAPABILITIES["device_id"])
+        .order_by(desc(DeviceEventRecord.received_at))
+        .limit(1)
+    )
+    last_seen = latest.received_at if latest else None
+    if isinstance(last_seen, datetime) and last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=UTC)
+    device["last_seen_at"] = last_seen
+    if latest and latest.event == "online":
+        device["connection"] = "online"
     if isinstance(last_seen, datetime) and datetime.now(UTC) - last_seen > timedelta(seconds=45):
         device["connection"] = "offline"
     return device
@@ -85,17 +105,13 @@ def sessions() -> list[object]:
 
 
 @app.post("/api/v1/device-events", status_code=status.HTTP_202_ACCEPTED, tags=["devices"])
-def receive_device_event(event: DeviceEvent) -> dict[str, object]:
-    key = (event.device_id, event.message_id)
+def receive_device_event(event: DeviceEvent, db: Session = Depends(get_db)) -> dict[str, object]:
     received_at = datetime.now(UTC)
-    with EVENT_LOCK:
-        if key in DEVICE_EVENTS:
-            return {"accepted": True, "duplicate": True, "message_id": event.message_id}
-        DEVICE_EVENTS[key] = {**event.model_dump(), "received_at": received_at}
-        if event.device_id == CAPABILITIES["device_id"]:
-            if event.event == "online":
-                CAPABILITIES["connection"] = "online"
-            elif event.event == "offline":
-                CAPABILITIES["connection"] = "offline"
-            CAPABILITIES["last_seen_at"] = received_at
+    record = DeviceEventRecord(**event.model_dump(), received_at=received_at)
+    db.add(record)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"accepted": True, "duplicate": True, "message_id": event.message_id}
     return {"accepted": True, "duplicate": False, "message_id": event.message_id}

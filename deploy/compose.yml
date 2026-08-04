@@ -3,6 +3,8 @@ services:
     build:
       context: ..
     restart: unless-stopped
+    environment:
+      TONGUE_SMART_DATABASE_URL: "${TONGUE_SMART_DATABASE_URL:?set database URL in deploy/.env}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 30s
