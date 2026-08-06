@@ -175,7 +175,15 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         batch = {"message_id": f"batch-{uuid4()}", "device_id": "tongue-smart-v3", "sequence": 0, "checksum": checksum, "samples": samples}
         device_headers = {"X-Device-Key": "test-device-key"}
         active = client.get("/api/v1/device/sessions/active?device_id=tongue-smart-v3", headers=device_headers)
-        assert active.status_code == 200 and active.json()[0]["next_sequence"] == 0
+        assert active.status_code == 200 and active.json()[0]["next_sequence"] == 0 and active.json()[0]["control"] is None
+        assert client.post(f"/api/v1/sessions/{session['id']}/control", headers=headers, json={
+            "measurement": "tongue_pressure", "phase": "recording", "protocol_stage": "tongue_press",
+        }).status_code == 422
+        control = client.post(f"/api/v1/sessions/{session['id']}/control", headers=headers, json={
+            "measurement": "tongue_pressure", "phase": "recording", "protocol_stage": "tongue_press", "fsr_point": "median_anterior",
+        })
+        assert control.status_code == 201 and control.json()["fsr_point"] == "median_anterior"
+        assert client.get(f"/api/v1/sessions/{session['id']}/control", headers=headers).json()["phase"] == "recording"
         first = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
         duplicate = client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=batch)
         assert first.status_code == 202 and first.json()["duplicate"] is False

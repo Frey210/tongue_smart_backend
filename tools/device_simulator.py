@@ -146,8 +146,25 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     print(f"Simulating {session['session_code']} ({', '.join(session['modules'])}), sequence starts at {sequence}")
     while sent < target and not stopped:
+        current = next((item for item in client.active_sessions() if item["id"] == session["id"]), None)
+        if current is None:
+            print("Session is no longer active. Simulator stopped.")
+            break
+        control = current.get("control")
+        if not control or control["phase"] == "paused":
+            print("Waiting for measurement control from dashboard…")
+            time.sleep(max(1.0, args.interval))
+            continue
+        if control["phase"] == "completed":
+            print("Measurement stage completed. Waiting for another stage…")
+            time.sleep(max(1.0, args.interval))
+            continue
+        stage_name = control["protocol_stage"]
+        if control.get("fsr_point"):
+            stage_name = f"{stage_name}:{control['fsr_point']}"
+        controlled_session = {**current, "modules": [control["measurement"]], "protocol_stages": [stage_name]}
         count = min(args.batch_size, target - sent)
-        samples = make_samples(session, sent, count, args.sample_rate, rng)
+        samples = make_samples(controlled_session, sent, count, args.sample_rate, rng)
         if args.dry_run:
             print(json.dumps(samples[: min(3, len(samples))], indent=2))
             return 0
@@ -166,7 +183,7 @@ def main() -> int:
                 print(f"Retry {attempt}/3 in {delay}s: {exc}", file=sys.stderr)
                 time.sleep(delay)
         time.sleep(max(0, args.interval))
-    print(f"Done. Generated {sent} time samples across {len(session['modules'])} module(s).")
+    print(f"Done. Generated {sent} controlled time samples.")
     return 0
 
 

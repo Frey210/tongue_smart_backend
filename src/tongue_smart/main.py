@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SessionControlRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -162,6 +162,13 @@ class ExportCreate(BaseModel):
     include_markers: bool = True
 
 
+class SessionControlCreate(BaseModel):
+    measurement: MeasurementModule
+    phase: Literal["baseline", "recording", "paused", "completed"]
+    protocol_stage: str = Field(min_length=1, max_length=64)
+    fsr_point: Literal["median_anterior", "median_middle", "median_posterior", "lateral_left", "lateral_right"] | None = None
+
+
 class DeviceEvent(BaseModel):
     schema_version: int = Field(default=1, ge=1)
     message_id: str = Field(min_length=1, max_length=96)
@@ -208,6 +215,19 @@ def examination_view(session: ExaminationSessionRecord, db: Session) -> dict[str
         "status": session.status, "created_at": session.created_at, "started_at": session.started_at,
         "completed_at": session.completed_at,
     }
+
+
+def control_view(control: SessionControlRecord | None) -> dict[str, object] | None:
+    if control is None:
+        return None
+    return {"id": control.id, "measurement": control.measurement, "phase": control.phase,
+            "protocol_stage": control.protocol_stage, "fsr_point": control.fsr_point,
+            "actor_id": control.actor_id, "created_at": control.created_at}
+
+
+def latest_control(db: Session, session_id: str) -> SessionControlRecord | None:
+    return db.scalar(select(SessionControlRecord).where(SessionControlRecord.session_id == session_id)
+                     .order_by(desc(SessionControlRecord.created_at)).limit(1))
 
 
 def add_audit(db: Session, actor_id: str, action: str, entity_type: str, entity_id: str, detail: str = "") -> None:
@@ -650,8 +670,48 @@ def active_device_sessions(
         last_sequence = db.scalar(select(func.max(SampleBatchRecord.sequence)).where(SampleBatchRecord.session_id == record.id))
         item = examination_view(record, db)
         item["next_sequence"] = 0 if last_sequence is None else last_sequence + 1
+        item["control"] = control_view(latest_control(db, record.id))
         result.append(item)
     return result
+
+
+@app.get("/api/v1/sessions/{session_id}/control", tags=["sessions"])
+def get_session_control(
+    session_id: str,
+    _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> dict[str, object] | None:
+    if db.get(ExaminationSessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    return control_view(latest_control(db, session_id))
+
+
+@app.post("/api/v1/sessions/{session_id}/control", status_code=201, tags=["sessions"])
+def set_session_control(
+    session_id: str,
+    payload: SessionControlCreate,
+    actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(ExaminationSessionRecord, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    if session.status != "active":
+        raise HTTPException(status_code=409, detail="Kontrol pengukuran hanya tersedia untuk sesi aktif")
+    if payload.measurement not in session.modules:
+        raise HTTPException(status_code=422, detail="Modul tidak dipilih pada sesi ini")
+    if payload.measurement == "tongue_pressure" and payload.phase in ("baseline", "recording") and payload.fsr_point is None:
+        raise HTTPException(status_code=422, detail="Titik ukur FSR wajib dipilih")
+    control = SessionControlRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
+                                   measurement=payload.measurement, phase=payload.phase,
+                                   protocol_stage=payload.protocol_stage,
+                                   fsr_point=payload.fsr_point if payload.measurement == "tongue_pressure" else None,
+                                   created_at=datetime.now(UTC))
+    db.add(control)
+    add_audit(db, actor.id, "session.control", "examination_session", session_id,
+              f"{control.measurement}:{control.phase}:{control.fsr_point or '-'}")
+    db.commit()
+    return control_view(control) or {}
 
 
 @app.get("/api/v1/sessions/{session_id}/results", tags=["results"])
@@ -675,7 +735,8 @@ def session_results(
     markers = db.scalars(select(EventMarkerRecord).where(EventMarkerRecord.session_id == session_id).order_by(EventMarkerRecord.occurred_at)).all()
     notes = db.scalars(select(OperatorNoteRecord).where(OperatorNoteRecord.session_id == session_id).order_by(desc(OperatorNoteRecord.created_at))).all()
     return {
-        "session": examination_view(session, db), "channels": channels, "selected_channel": sensor_channel,
+        "session": examination_view(session, db), "control": control_view(latest_control(db, session_id)),
+        "channels": channels, "selected_channel": sensor_channel,
         "sample_count": len(samples), "batch_count": len(batches), "downsample_stride": stride,
         "summary": {"minimum": min(values) if values else None, "maximum": max(values) if values else None,
                     "average": sum(values) / len(values) if values else None, "quality": quality},

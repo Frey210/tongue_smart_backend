@@ -158,3 +158,16 @@ class ExportJobRecord(Base):
     filename: Mapped[str] = mapped_column(String(160))
     csv_content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class SessionControlRecord(Base):
+    __tablename__ = "session_controls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("examination_sessions.id"), index=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    measurement: Mapped[str] = mapped_column(String(32), index=True)
+    phase: Mapped[str] = mapped_column(String(24), index=True)
+    protocol_stage: Mapped[str] = mapped_column(String(64))
+    fsr_point: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
