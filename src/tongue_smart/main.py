@@ -294,7 +294,12 @@ def require_device_key(
 ) -> DeviceRecord | None:
     if x_device_id:
         device = db.scalar(select(DeviceRecord).where(DeviceRecord.device_id == x_device_id))
-        if device is None or not device.is_active or not x_device_key:
+        if device is None:
+            legacy_key = os.getenv("TONGUE_SMART_DEVICE_API_KEY", "")
+            if x_device_id == CAPABILITIES["device_id"] and x_device_key and legacy_key and hmac.compare_digest(x_device_key, legacy_key):
+                return None
+            raise HTTPException(status_code=401, detail="Invalid device credential")
+        if not device.is_active or not x_device_key:
             raise HTTPException(status_code=401, detail="Invalid device credential")
         if not hmac.compare_digest(device.credential_hash, digest_token(x_device_key)):
             raise HTTPException(status_code=401, detail="Invalid device credential")
