@@ -11,6 +11,7 @@ import json
 import math
 import os
 import random
+import secrets
 import signal
 import sys
 import time
@@ -36,10 +37,10 @@ class DeviceClient:
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict | list:
         data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
-        request = Request(self.base_url + path, data=data, method=method, headers={
-            "Accept": "application/json", "Content-Type": "application/json", "X-Device-Key": self.api_key,
-            "User-Agent": "TongueSmart-DeviceSimulator/1.0",
-        })
+        headers = {"Accept": "application/json", "Content-Type": "application/json",
+                   "X-Device-ID": self.device_id, "X-Device-Key": self.api_key,
+                   "User-Agent": "TongueSmart-DeviceSimulator/1.1"}
+        request = Request(self.base_url + path, data=data, method=method, headers=headers)
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = response.read()
@@ -59,6 +60,23 @@ class DeviceClient:
         body = {"message_id": f"sim-{self.device_id}-{uuid4()}", "device_id": self.device_id,
                 "sequence": sequence, "checksum": hashlib.sha256(canonical.encode()).hexdigest(), "samples": samples}
         return self.request("POST", f"/sessions/{session_id}/batches", body)  # type: ignore[return-value]
+
+
+def public_request(base_url: str, method: str, path: str, body: dict | None = None) -> dict:
+    data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
+    request = Request(base_url.rstrip("/") + path, data=data, method=method, headers={
+        "Accept": "application/json", "Content-Type": "application/json",
+        "User-Agent": "TongueSmart-DeviceSimulator/1.1",
+    })
+    try:
+        with urlopen(request, timeout=15.0) as response:
+            payload = response.read()
+            return json.loads(payload) if payload else {}
+    except HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
 
 
 def sample_value(module: str, elapsed: float, rng: random.Random) -> tuple[float, float]:
@@ -110,6 +128,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Simulate Tongue Smart ESP HTTPS batch ingest")
     parser.add_argument("--base-url", default="https://tongue-smart.farlabs.my.id/api/v1")
     parser.add_argument("--device-id", default="tongue-smart-v3")
+    parser.add_argument("--device-key", help="Unique device secret; defaults to TONGUE_SMART_DEVICE_API_KEY")
+    parser.add_argument("--hardware-uid", help="Stable hardware UID; defaults to SIM:<device-id>")
+    parser.add_argument("--firmware-version", default="sim-1.1")
+    parser.add_argument("--pair", action="store_true", help="Create a pairing code, wait for dashboard claim, then run")
     parser.add_argument("--session", help="Active session UUID or session code")
     parser.add_argument("--duration", type=float, default=30.0, help="Simulation duration in seconds")
     parser.add_argument("--sample-rate", type=float, default=10.0, help="Samples per channel per second")
@@ -124,7 +146,31 @@ def main() -> int:
     args = parse_args()
     if args.duration <= 0 or args.sample_rate <= 0 or not 1 <= args.batch_size <= 166:
         raise SystemExit("duration/sample-rate must be positive; batch-size must be 1..166")
-    api_key = os.getenv("TONGUE_SMART_DEVICE_API_KEY") or getpass.getpass("Device API key: ")
+    api_key = args.device_key or os.getenv("TONGUE_SMART_DEVICE_API_KEY")
+    if args.pair:
+        api_key = api_key or secrets.token_urlsafe(32)
+        pairing = public_request(args.base_url, "POST", "/device/pairings", {
+            "device_id": args.device_id,
+            "hardware_uid": args.hardware_uid or f"SIM:{args.device_id}",
+            "device_secret": api_key,
+            "firmware_version": args.firmware_version,
+            "capabilities": {"transport": ["https"], "emg_channels": 1,
+                             "tongue_pressure_channels": 1, "lip_force": True,
+                             "motorized_traction": False, "wifi_portal": False, "mqtt": False},
+        })
+        print(f"Pairing code: {pairing['pairing_code']}")
+        print("Open Dashboard > Perangkat, enter this code, and assign a device name.")
+        while True:
+            state = public_request(args.base_url, "GET", f"/device/pairings/{pairing['pairing_token']}")
+            if state["status"] == "claimed":
+                print(f"Device claimed as {state['device_id']}.")
+                print("Keep this unique secret for the next run:")
+                print(f"  --device-id {args.device_id} --device-key {api_key}")
+                break
+            if state["status"] == "expired":
+                raise SystemExit("Pairing code expired; run --pair again")
+            time.sleep(2)
+    api_key = api_key or getpass.getpass("Device API key: ")
     if not api_key:
         raise SystemExit("Device API key is required")
     client = DeviceClient(args.base_url, args.device_id, api_key)

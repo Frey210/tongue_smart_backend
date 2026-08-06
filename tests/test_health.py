@@ -209,3 +209,56 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         assert download.headers["x-content-sha256"] == export.json()["checksum"]
         assert "Tekanan puncak" in download.text and "fsr_1" in download.text
         assert client.post(f"/api/v1/sessions/{session['id']}/finalize", headers=headers).json()["status"] == "completed"
+
+
+def test_pair_claim_and_device_credentials_are_isolated() -> None:
+    operator_email = f"operator-{uuid4()}@example.test"
+    first_id = f"TS-SIM-{uuid4().hex[:6]}"
+    second_id = f"TS-SIM-{uuid4().hex[:6]}"
+    with TestClient(app) as client:
+        create_test_user("operator", operator_email)
+        login = client.post("/api/v1/auth/login", json={
+            "email": operator_email, "password": "valid-password-123",
+        }).json()
+        user_headers = {"Authorization": f"Bearer {login['access_token']}"}
+
+        def pair_and_claim(device_id: str, secret: str) -> dict:
+            pairing = client.post("/api/v1/device/pairings", json={
+                "device_id": device_id,
+                "hardware_uid": f"SIM:{device_id}",
+                "device_secret": secret,
+                "firmware_version": "sim-1.0",
+                "capabilities": {"emg_channels": 1, "tongue_pressure_channels": 1, "lip_force": True},
+            })
+            assert pairing.status_code == 201
+            pairing_data = pairing.json()
+            assert client.get(f"/api/v1/device/pairings/{pairing_data['pairing_token']}").json()["status"] == "pending"
+            claimed = client.post("/api/v1/devices/claim", headers=user_headers, json={
+                "pairing_code": pairing_data["pairing_code"], "display_name": f"Simulator {device_id}",
+            })
+            assert claimed.status_code == 201
+            assert client.get(f"/api/v1/device/pairings/{pairing_data['pairing_token']}").json()["status"] == "claimed"
+            return claimed.json()
+
+        first_secret = "first-device-secret-1234567890abcdef"
+        second_secret = "second-device-secret-1234567890abcdef"
+        first = pair_and_claim(first_id, first_secret)
+        pair_and_claim(second_id, second_secret)
+        assert first["owner_id"] == login["user"]["id"]
+        assert first["credential_hint"] == first_secret[-6:]
+        listed = client.get("/api/v1/devices", headers=user_headers).json()
+        assert {first_id, second_id}.issubset({item["device_id"] for item in listed})
+
+        subject = client.post("/api/v1/subjects", headers=user_headers, json={
+            "subject_code": f"TS-{uuid4().hex[:8]}", "initials": "MD",
+            "research_group": "Multi device", "consent_status": "granted",
+        }).json()
+        session = client.post("/api/v1/sessions", headers=user_headers, json={
+            "subject_id": subject["id"], "device_id": first_id,
+            "modules": ["tongue_pressure"], "protocol_stages": ["tongue_press"],
+        }).json()
+        client.post(f"/api/v1/sessions/{session['id']}/start", headers=user_headers)
+        first_headers = {"X-Device-ID": first_id, "X-Device-Key": first_secret}
+        second_headers = {"X-Device-ID": second_id, "X-Device-Key": second_secret}
+        assert client.get(f"/api/v1/device/sessions/active?device_id={first_id}", headers=first_headers).status_code == 200
+        assert client.get(f"/api/v1/device/sessions/active?device_id={first_id}", headers=second_headers).status_code == 403

@@ -25,7 +25,7 @@ Firmware tidak memanggil logic dashboard. Frontend tidak mengakses database lang
 
 - User, Role, RefreshSession
 - Subject, ConsentRecord
-- Device, DeviceCapability, Calibration
+- Device, DevicePairing, credential unik ter-hash, DeviceCapability, Calibration
 - ExaminationSession, ProtocolStage
 - EMG stage menyimpan `electrode_site` terstruktur dan `electrode_site_note` untuk pilihan lokasi lain.
 - SampleBatch, MeasurementSummary, EventMarker, OperatorNote
@@ -75,6 +75,9 @@ POST /api/v1/auth/login
 GET  /api/v1/subjects
 POST /api/v1/subjects
 GET  /api/v1/devices
+POST /api/v1/device/pairings
+GET  /api/v1/device/pairings/{token}
+POST /api/v1/devices/claim
 POST /api/v1/sessions
 POST /api/v1/sessions/{id}/batches
 POST /api/v1/sessions/{id}/finalize
@@ -88,7 +91,9 @@ POST /api/v1/exports
 - Unique ingest key: `(device_id, message_id)`.
 - UTC timestamps plus receive timestamp.
 - PHI/identitas langsung tidak masuk raw sensor payload.
-- Secrets hanya dari environment/secret store.
+- Secret dibuat per perangkat dan hanya hash-nya yang disimpan backend; environment key hanya jalur kompatibilitas legacy.
+- Credential menentukan `device_id`; nilai identitas pada query/payload tidak boleh mengganti identitas credential.
+- Maksimum satu sesi aktif per perangkat.
 - Audit log append-only untuk consent, calibration, export, dan perubahan akses.
 - Motor tidak pernah dikendalikan oleh endpoint cloud pada MVP.
 

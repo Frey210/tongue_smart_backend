@@ -6,6 +6,7 @@ import hmac
 import json
 from io import StringIO
 import os
+import secrets
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -19,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SessionControlRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, DevicePairingRecord, DeviceRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SessionControlRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -179,6 +180,19 @@ class DeviceEvent(BaseModel):
     uptime_ms: int | None = Field(default=None, ge=0)
 
 
+class DevicePairingStart(BaseModel):
+    device_id: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    hardware_uid: str = Field(min_length=4, max_length=96, pattern=r"^[A-Za-z0-9:_-]+$")
+    device_secret: str = Field(min_length=32, max_length=256)
+    firmware_version: str = Field(min_length=1, max_length=32)
+    capabilities: dict[str, object] = Field(default_factory=dict)
+
+
+class DeviceClaim(BaseModel):
+    pairing_code: str = Field(min_length=6, max_length=16)
+    display_name: str = Field(min_length=2, max_length=120)
+
+
 def user_view(user: UserRecord) -> dict[str, object]:
     return {
         "id": user.id, "email": user.email, "full_name": user.full_name,
@@ -273,12 +287,27 @@ def require_roles(*roles: Role):
     return dependency
 
 
-def require_device_key(x_device_key: Annotated[str | None, Header()] = None) -> None:
+def require_device_key(
+    db: Annotated[Session, Depends(get_db)],
+    x_device_key: Annotated[str | None, Header()] = None,
+    x_device_id: Annotated[str | None, Header()] = None,
+) -> DeviceRecord | None:
+    if x_device_id:
+        device = db.scalar(select(DeviceRecord).where(DeviceRecord.device_id == x_device_id))
+        if device is None or not device.is_active or not x_device_key:
+            raise HTTPException(status_code=401, detail="Invalid device credential")
+        if not hmac.compare_digest(device.credential_hash, digest_token(x_device_key)):
+            raise HTTPException(status_code=401, detail="Invalid device credential")
+        device.status = "online"
+        device.last_seen_at = datetime.now(UTC)
+        db.commit()
+        return device
     expected = os.getenv("TONGUE_SMART_DEVICE_API_KEY", "")
     if not expected:
         raise HTTPException(status_code=503, detail="Device ingest is not configured")
     if not x_device_key or not hmac.compare_digest(x_device_key, expected):
         raise HTTPException(status_code=401, detail="Invalid device credential")
+    return None
 
 
 CAPABILITIES = {
@@ -294,6 +323,44 @@ CAPABILITIES = {
     "mqtt": False,
     "last_seen_at": None,
 }
+
+
+def device_view(device: DeviceRecord) -> dict[str, object]:
+    capabilities = {**CAPABILITIES, **(device.capabilities or {})}
+    connection = device.status
+    last_seen = device.last_seen_at
+    if isinstance(last_seen, datetime):
+        comparable = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=UTC)
+        if datetime.now(UTC) - comparable > timedelta(seconds=45):
+            connection = "offline"
+    capabilities.update({
+        "id": device.id,
+        "device_id": device.device_id,
+        "hardware_uid": device.hardware_uid,
+        "display_name": device.display_name,
+        "owner_id": device.owner_id,
+        "firmware_version": device.firmware_version,
+        "connection": connection,
+        "last_seen_at": device.last_seen_at,
+        "registered_at": device.created_at,
+        "credential_hint": device.credential_hint,
+        "legacy": False,
+    })
+    return capabilities
+
+
+def legacy_device_view(db: Session) -> dict[str, object]:
+    device = device_snapshot(db)
+    device.update({
+        "id": "legacy-tongue-smart-v3",
+        "hardware_uid": "legacy-unprovisioned",
+        "display_name": "Tongue Smart v3",
+        "owner_id": None,
+        "registered_at": None,
+        "credential_hint": None,
+        "legacy": True,
+    })
+    return device
 
 
 @app.post("/api/v1/auth/login", tags=["auth"])
@@ -502,9 +569,11 @@ def dashboard_summary(
     _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
+    registered_devices = db.scalars(select(DeviceRecord).where(DeviceRecord.is_active.is_(True))).all()
+    registered_online = any(device_view(record)["connection"] == "online" for record in registered_devices)
     device = device_snapshot(db)
     return {
-        "device_status": device["connection"],
+        "device_status": "online" if registered_online or device["connection"] == "online" else "offline",
         "pending_sync": db.scalar(select(func.count()).select_from(ExaminationSessionRecord).where(ExaminationSessionRecord.status.in_(["prepared", "active"]))) or 0,
         "completed_sessions": db.scalar(select(func.count()).select_from(ExaminationSessionRecord).where(ExaminationSessionRecord.status == "completed")) or 0,
         "subject_count": db.scalar(select(func.count()).select_from(SubjectRecord).where(SubjectRecord.is_active.is_(True))) or 0,
@@ -518,7 +587,105 @@ def current_device(
     _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    return device_snapshot(db)
+    registered = db.scalar(select(DeviceRecord).where(DeviceRecord.is_active.is_(True)).order_by(DeviceRecord.created_at))
+    return device_view(registered) if registered else legacy_device_view(db)
+
+
+@app.get("/api/v1/devices", tags=["devices"])
+def devices(
+    _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    records = db.scalars(select(DeviceRecord).where(DeviceRecord.is_active.is_(True)).order_by(DeviceRecord.display_name)).all()
+    result = [device_view(record) for record in records]
+    if not any(item["device_id"] == CAPABILITIES["device_id"] for item in result):
+        result.append(legacy_device_view(db))
+    return result
+
+
+@app.post("/api/v1/device/pairings", status_code=201, tags=["devices"])
+def start_device_pairing(payload: DevicePairingStart, db: Session = Depends(get_db)) -> dict[str, object]:
+    device_id = payload.device_id.strip()
+    hardware_uid = payload.hardware_uid.strip().upper()
+    existing = db.scalar(select(DeviceRecord).where(or_(
+        DeviceRecord.device_id == device_id, DeviceRecord.hardware_uid == hardware_uid,
+    )))
+    if existing:
+        raise HTTPException(status_code=409, detail="Perangkat sudah terdaftar")
+    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    while True:
+        code = "TS-" + "".join(secrets.choice(alphabet) for _ in range(6))
+        code_hash = digest_token(code)
+        collision = db.scalar(select(DevicePairingRecord).where(
+            DevicePairingRecord.pairing_code_hash == code_hash,
+            DevicePairingRecord.claimed_at.is_(None),
+            DevicePairingRecord.expires_at > datetime.now(UTC),
+        ))
+        if collision is None:
+            break
+    pairing_token = secrets.token_urlsafe(32)
+    now = datetime.now(UTC)
+    record = DevicePairingRecord(
+        id=str(uuid4()), pairing_token_hash=digest_token(pairing_token), pairing_code_hash=code_hash,
+        device_id=device_id, hardware_uid=hardware_uid, credential_hash=digest_token(payload.device_secret),
+        credential_hint=payload.device_secret[-6:], firmware_version=payload.firmware_version,
+        capabilities=payload.capabilities, expires_at=now + timedelta(minutes=10), claimed_at=None,
+        claimed_by=None, created_at=now,
+    )
+    db.add(record)
+    db.commit()
+    return {"pairing_token": pairing_token, "pairing_code": code, "expires_in": 600, "status": "pending"}
+
+
+@app.get("/api/v1/device/pairings/{pairing_token}", tags=["devices"])
+def pairing_status(pairing_token: str, db: Session = Depends(get_db)) -> dict[str, object]:
+    pairing = db.scalar(select(DevicePairingRecord).where(
+        DevicePairingRecord.pairing_token_hash == digest_token(pairing_token),
+    ))
+    if pairing is None:
+        raise HTTPException(status_code=404, detail="Pairing tidak ditemukan")
+    if pairing.claimed_at:
+        return {"status": "claimed", "device_id": pairing.device_id, "claimed_at": pairing.claimed_at}
+    expires_at = pairing.expires_at if pairing.expires_at.tzinfo else pairing.expires_at.replace(tzinfo=UTC)
+    if expires_at < datetime.now(UTC):
+        return {"status": "expired", "device_id": pairing.device_id}
+    return {"status": "pending", "device_id": pairing.device_id, "expires_at": pairing.expires_at}
+
+
+@app.post("/api/v1/devices/claim", status_code=201, tags=["devices"])
+def claim_device(
+    payload: DeviceClaim,
+    actor: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    code_hash = digest_token(payload.pairing_code.strip().upper())
+    pairing = db.scalar(select(DevicePairingRecord).where(
+        DevicePairingRecord.pairing_code_hash == code_hash,
+        DevicePairingRecord.claimed_at.is_(None),
+        DevicePairingRecord.expires_at > datetime.now(UTC),
+    ).order_by(desc(DevicePairingRecord.created_at)))
+    if pairing is None:
+        raise HTTPException(status_code=404, detail="Kode pairing tidak ditemukan atau kedaluwarsa")
+    existing = db.scalar(select(DeviceRecord).where(or_(
+        DeviceRecord.device_id == pairing.device_id,
+        DeviceRecord.hardware_uid == pairing.hardware_uid,
+    )))
+    if existing:
+        raise HTTPException(status_code=409, detail="Perangkat sudah terdaftar")
+    now = datetime.now(UTC)
+    device = DeviceRecord(
+        id=str(uuid4()), device_id=pairing.device_id, hardware_uid=pairing.hardware_uid,
+        display_name=payload.display_name.strip(), owner_id=actor.id,
+        credential_hash=pairing.credential_hash, credential_hint=pairing.credential_hint,
+        firmware_version=pairing.firmware_version, capabilities=pairing.capabilities,
+        status="offline", last_seen_at=None, is_active=True, created_at=now,
+    )
+    pairing.claimed_at = now
+    pairing.claimed_by = actor.id
+    db.add(device)
+    add_audit(db, actor.id, "device.claimed", "device", device.id, f"device_id={device.device_id}")
+    db.commit()
+    return device_view(device)
 
 
 def device_snapshot(db: Session) -> dict[str, object]:
@@ -560,7 +727,13 @@ def create_examination_session(
         raise HTTPException(status_code=404, detail="Subjek aktif tidak ditemukan")
     if subject.consent_status != "granted":
         raise HTTPException(status_code=409, detail="Consent subjek harus disetujui sebelum membuat sesi")
-    supported = {"emg" if CAPABILITIES["emg_channels"] else "", "tongue_pressure" if CAPABILITIES["tongue_pressure_channels"] else "", "lip_force" if CAPABILITIES["lip_force"] else ""}
+    registered_device = db.scalar(select(DeviceRecord).where(
+        DeviceRecord.device_id == payload.device_id, DeviceRecord.is_active.is_(True),
+    ))
+    if registered_device is None and payload.device_id != CAPABILITIES["device_id"]:
+        raise HTTPException(status_code=404, detail="Perangkat terdaftar tidak ditemukan")
+    device_capabilities = {**CAPABILITIES, **(registered_device.capabilities if registered_device else {})}
+    supported = {"emg" if device_capabilities["emg_channels"] else "", "tongue_pressure" if device_capabilities["tongue_pressure_channels"] else "", "lip_force" if device_capabilities["lip_force"] else ""}
     unsupported = set(payload.modules) - supported
     if unsupported:
         raise HTTPException(status_code=422, detail=f"Modul tidak tersedia: {', '.join(sorted(unsupported))}")
@@ -595,6 +768,13 @@ def start_examination_session(
         raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
     if session.status != "prepared":
         raise HTTPException(status_code=409, detail="Hanya sesi prepared yang dapat dimulai")
+    busy_session = db.scalar(select(ExaminationSessionRecord).where(
+        ExaminationSessionRecord.device_id == session.device_id,
+        ExaminationSessionRecord.status == "active",
+        ExaminationSessionRecord.id != session.id,
+    ))
+    if busy_session:
+        raise HTTPException(status_code=409, detail=f"Perangkat sedang digunakan oleh sesi {busy_session.session_code}")
     session.status = "active"
     session.started_at = datetime.now(UTC)
     add_audit(db, operator.id, "session.started", "examination_session", session.id)
@@ -624,7 +804,7 @@ def finalize_examination_session(
 def ingest_sample_batch(
     session_id: str,
     payload: SampleBatchIngest,
-    _: None = Depends(require_device_key),
+    authenticated_device: DeviceRecord | None = Depends(require_device_key),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     session = db.get(ExaminationSessionRecord, session_id)
@@ -632,6 +812,8 @@ def ingest_sample_batch(
         raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
     if session.status != "active":
         raise HTTPException(status_code=409, detail="Sesi belum aktif atau sudah selesai")
+    if authenticated_device and authenticated_device.device_id != payload.device_id:
+        raise HTTPException(status_code=403, detail="Credential tidak cocok dengan device_id payload")
     if payload.device_id != session.device_id:
         raise HTTPException(status_code=409, detail="Device tidak sesuai dengan sesi")
     sample_data = [sample.model_dump(mode="json") for sample in payload.samples]
@@ -658,9 +840,11 @@ def ingest_sample_batch(
 @app.get("/api/v1/device/sessions/active", tags=["ingest"])
 def active_device_sessions(
     device_id: str = Query(min_length=1, max_length=64),
-    _: None = Depends(require_device_key),
+    authenticated_device: DeviceRecord | None = Depends(require_device_key),
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
+    if authenticated_device and authenticated_device.device_id != device_id:
+        raise HTTPException(status_code=403, detail="Credential tidak cocok dengan device_id query")
     records = db.scalars(select(ExaminationSessionRecord).where(
         ExaminationSessionRecord.device_id == device_id,
         ExaminationSessionRecord.status == "active",

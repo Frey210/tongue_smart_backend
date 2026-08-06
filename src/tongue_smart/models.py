@@ -33,6 +33,42 @@ class UserRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class DeviceRecord(Base):
+    __tablename__ = "devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    hardware_uid: Mapped[str] = mapped_column(String(96), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    credential_hash: Mapped[str] = mapped_column(String(64))
+    credential_hint: Mapped[str] = mapped_column(String(12))
+    firmware_version: Mapped[str] = mapped_column(String(32))
+    capabilities: Mapped[dict[str, object]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(24), default="offline", index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class DevicePairingRecord(Base):
+    __tablename__ = "device_pairings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    pairing_token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    pairing_code_hash: Mapped[str] = mapped_column(String(64), index=True)
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
+    hardware_uid: Mapped[str] = mapped_column(String(96), index=True)
+    credential_hash: Mapped[str] = mapped_column(String(64))
+    credential_hint: Mapped[str] = mapped_column(String(12))
+    firmware_version: Mapped[str] = mapped_column(String(32))
+    capabilities: Mapped[dict[str, object]] = mapped_column(JSON)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class RefreshSessionRecord(Base):
     __tablename__ = "refresh_sessions"
 
