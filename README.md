@@ -23,7 +23,7 @@ $env:TONGUE_SMART_DEVICE_API_KEY = "<lihat credentials.md lokal>"
 python tools/device_simulator.py --duration 30 --sample-rate 10
 ```
 
-Simulator mencari sesi aktif, menghasilkan data sesuai modul sesi, mengirim batch ber-checksum, melanjutkan sequence terakhir, dan melakukan retry eksponensial. Gunakan `--help` untuk opsi session, batch, seed, base URL, dan dry-run.
+Simulator mencari sesi aktif lalu menunggu kontrol tahap dari tab Monitoring. Hanya modul/titik yang sedang berstatus `baseline` atau `recording` yang disimulasikan. Program mengirim batch ber-checksum, melanjutkan sequence terakhir, dan melakukan retry eksponensial. Gunakan `--help` untuk opsi session, batch, seed, base URL, dan dry-run.
 
 FastAPI foundation untuk sinkronisasi dan data riset. Pengukuran tidak bergantung pada backend.
 
