@@ -174,6 +174,10 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         checksum = hashlib.sha256(json.dumps(samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         batch = {"message_id": f"batch-{uuid4()}", "device_id": "tongue-smart-v3", "sequence": 0, "checksum": checksum, "samples": samples}
         device_headers = {"X-Device-ID": "tongue-smart-v3", "X-Device-Key": "test-device-key"}
+        invalid_samples = [{**samples[0], "measurement_unit": "N"}]
+        invalid_batch = {**batch, "message_id": f"batch-{uuid4()}", "samples": invalid_samples,
+                         "checksum": hashlib.sha256(json.dumps(invalid_samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        assert client.post(f"/api/v1/sessions/{session['id']}/batches", headers=device_headers, json=invalid_batch).status_code == 422
         active = client.get("/api/v1/device/sessions/active?device_id=tongue-smart-v3", headers=device_headers)
         assert active.status_code == 200 and active.json()[0]["next_sequence"] == 0 and active.json()[0]["control"] is None
         assert client.post(f"/api/v1/sessions/{session['id']}/control", headers=headers, json={

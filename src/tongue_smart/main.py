@@ -117,6 +117,11 @@ class SubjectUpdate(BaseModel):
 
 MeasurementModule = Literal["emg", "tongue_pressure", "lip_force"]
 ElectrodeSite = Literal["masseter_left", "masseter_right", "temporalis_left", "temporalis_right", "other"]
+SENSOR_CONTRACT = {
+    "emg_1": ("emg", "uV"),
+    "fsr_1": ("tongue_pressure", "kPa"),
+    "lip_force_1": ("lip_force", "N"),
+}
 
 
 class ExaminationSessionCreate(BaseModel):
@@ -821,6 +826,10 @@ def ingest_sample_batch(
         raise HTTPException(status_code=403, detail="Credential tidak cocok dengan device_id payload")
     if payload.device_id != session.device_id:
         raise HTTPException(status_code=409, detail="Device tidak sesuai dengan sesi")
+    for sample in payload.samples:
+        expected = SENSOR_CONTRACT.get(sample.sensor_channel)
+        if expected is None or expected[0] not in session.modules or sample.measurement_unit != expected[1]:
+            raise HTTPException(status_code=422, detail=f"Kanal atau satuan tidak sesuai kontrak: {sample.sensor_channel}")
     sample_data = [sample.model_dump(mode="json") for sample in payload.samples]
     computed = hashlib.sha256(json.dumps(sample_data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if not hmac.compare_digest(computed, payload.checksum.lower()):
