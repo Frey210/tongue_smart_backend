@@ -39,7 +39,7 @@ class DeviceClient:
         data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
         headers = {"Accept": "application/json", "Content-Type": "application/json",
                    "X-Device-ID": self.device_id, "X-Device-Key": self.api_key,
-                   "User-Agent": "TongueSmart-DeviceSimulator/1.1"}
+                   "User-Agent": "TongueSmart-DeviceSimulator/1.2"}
         request = Request(self.base_url + path, data=data, method=method, headers=headers)
         try:
             with urlopen(request, timeout=self.timeout) as response:
@@ -66,7 +66,7 @@ def public_request(base_url: str, method: str, path: str, body: dict | None = No
     data = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
     request = Request(base_url.rstrip("/") + path, data=data, method=method, headers={
         "Accept": "application/json", "Content-Type": "application/json",
-        "User-Agent": "TongueSmart-DeviceSimulator/1.1",
+        "User-Agent": "TongueSmart-DeviceSimulator/1.2",
     })
     try:
         with urlopen(request, timeout=15.0) as response:
@@ -130,13 +130,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-id", default="tongue-smart-v3")
     parser.add_argument("--device-key", help="Unique device secret; defaults to TONGUE_SMART_DEVICE_API_KEY")
     parser.add_argument("--hardware-uid", help="Stable hardware UID; defaults to SIM:<device-id>")
-    parser.add_argument("--firmware-version", default="sim-1.1")
+    parser.add_argument("--firmware-version", default="sim-1.2")
     parser.add_argument("--pair", action="store_true", help="Create a pairing code, wait for dashboard claim, then run")
     parser.add_argument("--session", help="Active session UUID or session code")
     parser.add_argument("--duration", type=float, default=30.0, help="Simulation duration in seconds")
-    parser.add_argument("--sample-rate", type=float, default=10.0, help="Samples per channel per second")
-    parser.add_argument("--batch-size", type=int, default=25, help="Time samples per HTTP batch")
-    parser.add_argument("--interval", type=float, default=0.5, help="Delay between batches")
+    parser.add_argument("--sample-rate", type=float, default=20.0, help="Samples per channel per second")
+    parser.add_argument("--batch-size", type=int, default=5, help="Time samples per HTTP batch")
+    parser.add_argument("--interval", type=float, default=0.25, help="Delay between batches")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true", help="Print one batch without sending")
     return parser.parse_args()
