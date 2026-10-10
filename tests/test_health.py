@@ -135,6 +135,8 @@ def test_subject_consent_workflow_and_role_permissions() -> None:
         updated = client.patch(f"/api/v1/subjects/{subject_id}", headers=operator_headers, json={"consent_status": "granted"})
         assert updated.status_code == 200
         assert updated.json()["consent_status"] == "granted"
+        assert client.delete(f"/api/v1/subjects/{subject_id}", headers=operator_headers).status_code == 204
+        assert all(item["id"] != subject_id for item in client.get("/api/v1/subjects", headers=operator_headers).json())
 
 
 def test_prepare_examination_session_validates_consent_and_emg_site() -> None:
@@ -146,12 +148,14 @@ def test_prepare_examination_session_validates_consent_and_emg_site() -> None:
         subject = client.post("/api/v1/subjects", headers=headers, json={
             "subject_code": f"TS-{uuid4().hex[:8]}", "initials": "EM", "research_group": "Pilot", "consent_status": "granted",
         }).json()
-        payload = {"subject_id": subject["id"], "device_id": "tongue-smart-v3", "modules": ["emg", "tongue_pressure"], "protocol_stages": ["rest", "clench"]}
+        session_name = f"Pemeriksaan EMG {uuid4().hex[:6]}"
+        payload = {"subject_id": subject["id"], "device_id": "tongue-smart-v3", "session_name": session_name, "modules": ["emg", "tongue_pressure"], "protocol_stages": []}
         assert client.post("/api/v1/sessions", headers=headers, json=payload).status_code == 422
         payload["electrode_site"] = "masseter_left"
         created = client.post("/api/v1/sessions", headers=headers, json=payload)
         assert created.status_code == 201
         assert created.json()["status"] == "prepared"
+        assert created.json()["session_code"] == session_name
         assert created.json()["electrode_site"] == "masseter_left"
         assert any(item["id"] == created.json()["id"] for item in client.get("/api/v1/sessions", headers=headers).json())
 
@@ -167,8 +171,9 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
             "subject_code": f"TS-{uuid4().hex[:8]}", "initials": "BT", "research_group": "Pilot", "consent_status": "granted",
         }).json()
         session = client.post("/api/v1/sessions", headers=headers, json={
-            "subject_id": subject["id"], "device_id": "tongue-smart-v3", "modules": ["tongue_pressure"], "protocol_stages": ["tongue_press"],
+            "subject_id": subject["id"], "device_id": "tongue-smart-v3", "session_name": f"Tekanan Lidah {uuid4().hex[:6]}", "modules": ["tongue_pressure"], "protocol_stages": [],
         }).json()
+        assert client.delete(f"/api/v1/subjects/{subject['id']}", headers=headers).status_code == 409
         assert client.post(f"/api/v1/sessions/{session['id']}/start", headers=headers).json()["status"] == "active"
         samples = [{"timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"), "protocol_stage": "tongue_press", "sensor_channel": "fsr_1", "raw_value": 1042.0, "calibrated_value": 12.4, "measurement_unit": "kPa", "signal_quality": "good"}]
         checksum = hashlib.sha256(json.dumps(samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -201,7 +206,7 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         results = client.get(f"/api/v1/sessions/{session['id']}/results?sensor_channel=fsr_1", headers=headers).json()
         assert results["sample_count"] == 1
         assert results["summary"]["maximum"] == 12.4
-        assert results["markers"][0]["label"] == "Tekanan puncak"
+        assert {item["label"] for item in results["markers"]} == {"Mulai ukur", "Tekanan puncak"}
         assert results["notes"][0]["note"] == "Sinyal stabil."
         export = client.post("/api/v1/exports", headers=headers, json={
             "session_ids": [session["id"]], "data_mode": "both", "include_metadata": True, "include_markers": True,
@@ -212,6 +217,8 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         assert "text/csv" in download.headers["content-type"]
         assert download.headers["x-content-sha256"] == export.json()["checksum"]
         assert "Tekanan puncak" in download.text and "fsr_1" in download.text
+        assert client.delete(f"/api/v1/exports/{export.json()['id']}", headers=headers).status_code == 204
+        assert client.get(f"/api/v1/exports/{export.json()['id']}/download", headers=headers).status_code == 404
         assert client.post(f"/api/v1/sessions/{session['id']}/finalize", headers=headers).json()["status"] == "completed"
 
 

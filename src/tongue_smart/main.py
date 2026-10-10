@@ -61,7 +61,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
-    allow_methods=["GET", "POST", "PATCH"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
@@ -127,8 +127,9 @@ SENSOR_CONTRACT = {
 class ExaminationSessionCreate(BaseModel):
     subject_id: str = Field(min_length=36, max_length=36)
     device_id: str = Field(min_length=1, max_length=64)
+    session_name: str | None = Field(default=None, min_length=3, max_length=48, pattern=r"^[A-Za-z0-9][A-Za-z0-9 _-]*$")
     modules: list[MeasurementModule] = Field(min_length=1, max_length=3)
-    protocol_stages: list[str] = Field(min_length=1, max_length=12)
+    protocol_stages: list[str] = Field(default_factory=list, max_length=12)
     electrode_site: ElectrodeSite | None = None
     electrode_site_note: str | None = Field(default=None, max_length=240)
 
@@ -574,6 +575,23 @@ def update_subject(
     return subject_view(subject)
 
 
+@app.delete("/api/v1/subjects/{subject_id}", status_code=204, tags=["subjects"])
+def delete_subject(
+    subject_id: str,
+    actor: UserRecord = Depends(require_roles("admin", "operator")),
+    db: Session = Depends(get_db),
+) -> Response:
+    subject = db.get(SubjectRecord, subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="Subjek tidak ditemukan")
+    if db.scalar(select(ExaminationSessionRecord.id).where(ExaminationSessionRecord.subject_id == subject_id).limit(1)):
+        raise HTTPException(status_code=409, detail="Subjek yang sudah memiliki sesi tidak dapat dihapus")
+    add_audit(db, actor.id, "subject.deleted", "subject", subject.id, subject.subject_code)
+    db.delete(subject)
+    db.commit()
+    return Response(status_code=204)
+
+
 @app.get("/api/v1/dashboard/summary", tags=["dashboard"])
 def dashboard_summary(
     _: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
@@ -753,8 +771,11 @@ def create_examination_session(
         if payload.electrode_site == "other" and not (payload.electrode_site_note or "").strip():
             raise HTTPException(status_code=422, detail="Catatan posisi elektroda wajib untuk pilihan lainnya")
     now = datetime.now(UTC)
+    session_code = " ".join(payload.session_name.split()) if payload.session_name else f"SESS-{now.year}-{uuid4().hex[:6].upper()}"
+    if db.scalar(select(ExaminationSessionRecord.id).where(func.lower(ExaminationSessionRecord.session_code) == session_code.lower())):
+        raise HTTPException(status_code=409, detail="Nama sesi sudah digunakan")
     session = ExaminationSessionRecord(
-        id=str(uuid4()), session_code=f"SESS-{now.year}-{uuid4().hex[:6].upper()}",
+        id=str(uuid4()), session_code=session_code,
         subject_id=subject.id, operator_id=operator.id, device_id=payload.device_id,
         modules=list(dict.fromkeys(payload.modules)), protocol_stages=list(dict.fromkeys(payload.protocol_stages)),
         electrode_site=payload.electrode_site if "emg" in payload.modules else None,
@@ -900,12 +921,17 @@ def set_session_control(
         raise HTTPException(status_code=422, detail="Modul tidak dipilih pada sesi ini")
     if payload.measurement == "tongue_pressure" and payload.phase in ("baseline", "recording") and payload.fsr_point is None:
         raise HTTPException(status_code=422, detail="Titik ukur FSR wajib dipilih")
+    now = datetime.now(UTC)
     control = SessionControlRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
                                    measurement=payload.measurement, phase=payload.phase,
                                    protocol_stage=payload.protocol_stage,
                                    fsr_point=payload.fsr_point if payload.measurement == "tongue_pressure" else None,
-                                   created_at=datetime.now(UTC))
+                                   created_at=now)
     db.add(control)
+    phase_label = {"baseline": "Mulai baseline", "recording": "Mulai ukur", "paused": "Jeda", "completed": "Selesai tahap"}[payload.phase]
+    db.add(EventMarkerRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
+                             protocol_stage=payload.protocol_stage, label=phase_label,
+                             occurred_at=now, created_at=now))
     add_audit(db, actor.id, "session.control", "examination_session", session_id,
               f"{control.measurement}:{control.phase}:{control.fsr_point or '-'}")
     db.commit()
@@ -958,6 +984,8 @@ def create_event_marker(
     session = db.get(ExaminationSessionRecord, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    if session.status != "active":
+        raise HTTPException(status_code=409, detail="Event marker hanya dapat ditambahkan saat sesi aktif")
     marker = EventMarkerRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
                                protocol_stage=payload.protocol_stage, label=payload.label.strip(),
                                occurred_at=payload.occurred_at, created_at=datetime.now(UTC))
@@ -1081,6 +1109,21 @@ def download_export(
     db.commit()
     return Response(content="\ufeff" + job.csv_content, media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{job.filename}"', "X-Content-SHA256": job.checksum})
+
+
+@app.delete("/api/v1/exports/{export_id}", status_code=204, tags=["exports"])
+def delete_export(
+    export_id: str,
+    actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> Response:
+    job = db.get(ExportJobRecord, export_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Export tidak ditemukan")
+    add_audit(db, actor.id, "export.deleted", "export_job", job.id, job.filename)
+    db.delete(job)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.post("/api/v1/device-events", status_code=status.HTTP_202_ACCEPTED, tags=["devices"])
