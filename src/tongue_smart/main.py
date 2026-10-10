@@ -1,16 +1,18 @@
 from contextlib import asynccontextmanager
+import base64
 import csv
 from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
-from io import StringIO
+from io import BytesIO, StringIO
 import os
 import secrets
 from typing import Annotated, Literal
 from uuid import uuid4
 
 import jwt
+import xlsxwriter
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -167,6 +169,7 @@ class ExportCreate(BaseModel):
     data_mode: Literal["raw", "processed", "both"] = "both"
     include_metadata: bool = True
     include_markers: bool = True
+    file_format: Literal["csv", "xlsx"] = "csv"
 
 
 class SessionControlCreate(BaseModel):
@@ -1016,7 +1019,8 @@ def export_view(job: ExportJobRecord) -> dict[str, object]:
     return {"id": job.id, "session_ids": job.session_ids, "data_mode": job.data_mode,
             "include_metadata": job.include_metadata, "include_markers": job.include_markers,
             "status": job.status, "row_count": job.row_count, "checksum": job.checksum,
-            "filename": job.filename, "created_at": job.created_at}
+            "filename": job.filename, "file_format": "xlsx" if job.filename.endswith(".xlsx") else "csv",
+            "created_at": job.created_at}
 
 
 def spreadsheet_safe(value: object) -> object:
@@ -1030,6 +1034,101 @@ def utc_timestamp_key(value: datetime | str) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def build_xlsx_export(rows: list[dict[str, object]], sessions: list[ExaminationSessionRecord],
+                      payload: ExportCreate, created_at: datetime) -> bytes:
+    output = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True, "strings_to_formulas": False, "strings_to_urls": False})
+    navy, teal, pale, line = "#033075", "#02999C", "#EAF7F7", "#D6E3EC"
+    title = workbook.add_format({"bold": True, "font_size": 16, "font_color": navy})
+    label = workbook.add_format({"bold": True, "font_color": teal})
+    header = workbook.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": navy,
+                                  "border": 1, "border_color": "#FFFFFF", "align": "center", "valign": "vcenter"})
+    date_format = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm:ss.000", "font_color": "#243B53"})
+    number_format = workbook.add_format({"num_format": "0.000"})
+
+    data_sheet = workbook.add_worksheet("Sensor Data")
+    data_sheet.hide_gridlines(2)
+    headers = list(rows[0]) if rows else ["timestamp", "subject_id", "session_id", "protocol_stage", "sensor_channel",
+                                                "raw_value", "calibrated_value", "measurement_unit", "signal_quality", "event_marker"]
+    data_sheet.write_row(0, 0, headers, header)
+    for row_index, row in enumerate(rows, start=1):
+        for column_index, key in enumerate(headers):
+            value = row.get(key, "")
+            if key == "timestamp" and value:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC).replace(tzinfo=None)
+                data_sheet.write_datetime(row_index, column_index, parsed, date_format)
+            elif isinstance(value, (int, float)):
+                data_sheet.write_number(row_index, column_index, value, number_format)
+            else:
+                data_sheet.write(row_index, column_index, spreadsheet_safe(value))
+    if rows:
+        data_sheet.add_table(0, 0, len(rows), len(headers) - 1, {
+            "name": "SensorData", "style": "Table Style Medium 2", "columns": [{"header": item} for item in headers],
+        })
+    else:
+        data_sheet.autofilter(0, 0, 0, len(headers) - 1)
+    data_sheet.freeze_panes(1, 0)
+    data_sheet.set_column(0, 0, 24)
+    data_sheet.set_column(1, 4, 20)
+    data_sheet.set_column(5, 7, 18)
+    data_sheet.set_column(8, len(headers) - 1, 22)
+
+    chart_sheet = workbook.add_worksheet("Charts")
+    chart_sheet.hide_gridlines(2)
+    chart_sheet.set_column("A:A", 3)
+    chart_sheet.set_column("B:M", 12)
+    chart_sheet.write("B2", "Tongue Smart - Laporan Pemeriksaan", title)
+    chart_sheet.write("B4", "Dibuat", label)
+    chart_sheet.write_datetime("C4", created_at.astimezone(UTC).replace(tzinfo=None), date_format)
+    chart_sheet.write("B5", "Sesi", label)
+    chart_sheet.write("C5", ", ".join(session.session_code for session in sessions))
+    chart_sheet.write("B6", "Jumlah sampel", label)
+    chart_sheet.write_number("C6", len(rows))
+
+    chart_value_key = "raw_value" if payload.data_mode == "raw" else "calibrated_value"
+    series: dict[tuple[str, str, str], list[tuple[datetime, float]]] = {}
+    for row in rows:
+        value = row.get(chart_value_key)
+        if not isinstance(value, (int, float)):
+            continue
+        key = (str(row["session_id"]), str(row["sensor_channel"]), str(row["measurement_unit"]))
+        timestamp = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00")).astimezone(UTC).replace(tzinfo=None)
+        series.setdefault(key, []).append((timestamp, float(value)))
+
+    helper_col = 20
+    palette = [teal, navy, "#3377B9", "#57A889", "#7A61B8"]
+    for index, ((session_code, channel, unit), points) in enumerate(series.items()):
+        time_col, value_col = helper_col + index * 2, helper_col + index * 2 + 1
+        chart_sheet.write(0, time_col, f"{session_code} timestamp")
+        chart_sheet.write(0, value_col, f"{session_code} {channel}")
+        for row_index, (timestamp, value) in enumerate(points, start=1):
+            chart_sheet.write_datetime(row_index, time_col, timestamp, date_format)
+            chart_sheet.write_number(row_index, value_col, value)
+        chart = workbook.add_chart({"type": "line"})
+        chart.add_series({
+            "name": f"{session_code} - {channel}",
+            "categories": ["Charts", 1, time_col, len(points), time_col],
+            "values": ["Charts", 1, value_col, len(points), value_col],
+            "line": {"color": palette[index % len(palette)], "width": 2},
+        })
+        chart.show_hidden_data()
+        chart.set_title({"name": f"{channel} ({unit})"})
+        chart.set_x_axis({"name": "Waktu", "date_axis": True, "num_format": "hh:mm:ss", "major_gridlines": {"visible": False}})
+        chart.set_y_axis({"name": unit, "major_gridlines": {"visible": True, "line": {"color": line}}})
+        chart.set_legend({"position": "top"})
+        chart.set_chartarea({"border": {"none": True}, "fill": {"color": "#FFFFFF"}})
+        chart.set_plotarea({"border": {"color": line}, "fill": {"color": pale}})
+        chart.set_size({"width": 500, "height": 260})
+        chart_sheet.insert_chart(7 + (index // 2) * 15, 1 + (index % 2) * 7, chart)
+    if not series:
+        chart_sheet.write("B9", "Belum ada nilai numerik yang dapat digambarkan.")
+    if series:
+        chart_sheet.set_column(helper_col, helper_col + len(series) * 2 - 1, None, None, {"hidden": True})
+    chart_sheet.freeze_panes(7, 0)
+    workbook.close()
+    return output.getvalue()
 
 
 @app.get("/api/v1/exports", tags=["exports"])
@@ -1052,13 +1151,10 @@ def create_export(
         if session is None:
             raise HTTPException(status_code=404, detail=f"Sesi tidak ditemukan: {session_id}")
         sessions_by_id[session_id] = session
-    output = StringIO(newline="")
     base_headers = ["timestamp", "subject_id", "session_id", "protocol_stage", "sensor_channel", "raw_value",
                     "calibrated_value", "measurement_unit", "signal_quality", "event_marker"]
     metadata_headers = ["device_id", "session_status", "electrode_site", "operator_id"] if payload.include_metadata else []
-    writer = csv.DictWriter(output, fieldnames=base_headers + metadata_headers, lineterminator="\n")
-    writer.writeheader()
-    row_count = 0
+    rows: list[dict[str, object]] = []
     for session_id, session in sessions_by_id.items():
         subject = db.get(SubjectRecord, session.subject_id)
         markers = db.scalars(select(EventMarkerRecord).where(EventMarkerRecord.session_id == session_id)).all() if payload.include_markers else []
@@ -1080,18 +1176,28 @@ def create_export(
                 if payload.include_metadata:
                     row.update({"device_id": session.device_id, "session_status": session.status,
                                 "electrode_site": session.electrode_site or "", "operator_id": session.operator_id})
-                writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
-                row_count += 1
-    content = output.getvalue()
-    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                rows.append(row)
     now = datetime.now(UTC)
+    if payload.file_format == "xlsx":
+        content_bytes = build_xlsx_export(rows, list(sessions_by_id.values()), payload, now)
+        # shortcut: keep XLSX in the legacy text column until exports need external binary storage.
+        stored_content = base64.b64encode(content_bytes).decode("ascii")
+        filename = f"tongue-smart-report-{now:%Y%m%d-%H%M%S}.xlsx"
+        checksum = hashlib.sha256(content_bytes).hexdigest()
+    else:
+        output = StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=base_headers + metadata_headers, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows({key: spreadsheet_safe(value) for key, value in row.items()} for row in rows)
+        stored_content = output.getvalue()
+        filename = f"tongue-smart-export-{now:%Y%m%d-%H%M%S}.csv"
+        checksum = hashlib.sha256(stored_content.encode("utf-8")).hexdigest()
     job = ExportJobRecord(id=str(uuid4()), requested_by=actor.id, session_ids=list(sessions_by_id),
                           data_mode=payload.data_mode, include_metadata=payload.include_metadata,
-                          include_markers=payload.include_markers, status="ready", row_count=row_count,
-                          checksum=checksum, filename=f"tongue-smart-export-{now:%Y%m%d-%H%M%S}.csv",
-                          csv_content=content, created_at=now)
+                          include_markers=payload.include_markers, status="ready", row_count=len(rows),
+                          checksum=checksum, filename=filename, csv_content=stored_content, created_at=now)
     db.add(job)
-    add_audit(db, actor.id, "export.created", "export_job", job.id, f"rows={row_count};checksum={checksum}")
+    add_audit(db, actor.id, "export.created", "export_job", job.id, f"rows={len(rows)};format={payload.file_format};checksum={checksum}")
     db.commit()
     return export_view(job)
 
@@ -1107,7 +1213,10 @@ def download_export(
         raise HTTPException(status_code=404, detail="Export tidak ditemukan")
     add_audit(db, actor.id, "export.downloaded", "export_job", job.id, job.checksum)
     db.commit()
-    return Response(content="\ufeff" + job.csv_content, media_type="text/csv; charset=utf-8",
+    is_xlsx = job.filename.endswith(".xlsx")
+    content = base64.b64decode(job.csv_content) if is_xlsx else ("\ufeff" + job.csv_content).encode("utf-8")
+    media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if is_xlsx else "text/csv; charset=utf-8"
+    return Response(content=content, media_type=media_type,
                     headers={"Content-Disposition": f'attachment; filename="{job.filename}"', "X-Content-SHA256": job.checksum})
 
 

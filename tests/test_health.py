@@ -2,6 +2,8 @@ from fastapi.testclient import TestClient
 from datetime import UTC, datetime
 import hashlib
 import json
+from io import BytesIO
+from zipfile import ZipFile
 from uuid import uuid4
 
 from tongue_smart.database import SessionLocal
@@ -217,6 +219,19 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         assert "text/csv" in download.headers["content-type"]
         assert download.headers["x-content-sha256"] == export.json()["checksum"]
         assert "Tekanan puncak" in download.text and "fsr_1" in download.text
+        xlsx_export = client.post("/api/v1/exports", headers=headers, json={
+            "session_ids": [session["id"]], "data_mode": "both", "include_metadata": True,
+            "include_markers": True, "file_format": "xlsx",
+        })
+        assert xlsx_export.status_code == 201 and xlsx_export.json()["filename"].endswith(".xlsx")
+        xlsx_download = client.get(f"/api/v1/exports/{xlsx_export.json()['id']}/download", headers=headers)
+        assert xlsx_download.status_code == 200
+        assert xlsx_download.headers["content-type"].startswith("application/vnd.openxmlformats")
+        with ZipFile(BytesIO(xlsx_download.content)) as workbook:
+            names = set(workbook.namelist())
+            assert "xl/worksheets/sheet1.xml" in names and "xl/worksheets/sheet2.xml" in names
+            assert any(name.startswith("xl/charts/chart") for name in names)
+        assert client.delete(f"/api/v1/exports/{xlsx_export.json()['id']}", headers=headers).status_code == 204
         assert client.delete(f"/api/v1/exports/{export.json()['id']}", headers=headers).status_code == 204
         assert client.get(f"/api/v1/exports/{export.json()['id']}/download", headers=headers).status_code == 404
         assert client.post(f"/api/v1/sessions/{session['id']}/finalize", headers=headers).json()["status"] == "completed"
