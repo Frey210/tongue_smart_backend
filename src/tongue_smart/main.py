@@ -1137,7 +1137,17 @@ def build_xlsx_export(rows: list[dict[str, object]], sessions: list[ExaminationS
         })
         chart.show_hidden_data()
         chart.set_title({"name": f"{channel} ({unit})"})
-        chart.set_x_axis({"name": "Waktu", "num_format": "hh:mm:ss.000", "major_gridlines": {"visible": False}})
+        duration_seconds = max(point[0] for point in points) - min(point[0] for point in points)
+        target_tick_seconds = max(duration_seconds.total_seconds() / 5, 1)
+        tick_seconds = next(
+            (value for value in (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
+             if value >= target_tick_seconds),
+            target_tick_seconds,
+        )
+        chart.set_x_axis({
+            "name": "Waktu", "num_format": "hh:mm:ss", "major_unit": tick_seconds / 86400,
+            "num_font": {"size": 8}, "major_gridlines": {"visible": False},
+        })
         chart.set_y_axis({"name": unit, "major_gridlines": {"visible": True, "line": {"color": line}}})
         chart.set_legend({"position": "top"})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "#FFFFFF"}})

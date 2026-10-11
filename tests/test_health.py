@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from io import BytesIO
@@ -30,10 +30,12 @@ def test_health() -> None:
 
 
 def test_xlsx_export_splits_sensor_tabs_and_uses_time_scatter_charts() -> None:
-    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    started_at = datetime.now(UTC)
     rows = [
-        {"timestamp": timestamp, "session_id": "SESS-TEST", "sensor_channel": channel,
+        {"timestamp": (started_at + timedelta(seconds=offset)).isoformat().replace("+00:00", "Z"),
+         "session_id": "SESS-TEST", "sensor_channel": channel,
          "raw_value": value, "calibrated_value": value, "measurement_unit": unit}
+        for offset in (0, 60)
         for channel, value, unit in (("fsr_1", 12.4, "kPa"), ("emg_1", 120.0, "uV"), ("lip_force_1", 8.2, "N"))
     ]
     content = build_xlsx_export(
@@ -46,6 +48,8 @@ def test_xlsx_export_splits_sensor_tabs_and_uses_time_scatter_charts() -> None:
         chart_names = [name for name in workbook.namelist() if name.startswith("xl/charts/chart")]
         assert len(chart_names) == 3
         assert all(b"scatterChart" in workbook.read(name) for name in chart_names)
+        assert all(b"<c:majorUnit" in workbook.read(name) and b"hh:mm:ss" in workbook.read(name)
+                   for name in chart_names)
 
 
 def test_idempotent_firmware_contract() -> None:
