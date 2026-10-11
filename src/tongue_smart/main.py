@@ -1048,37 +1048,58 @@ def build_xlsx_export(rows: list[dict[str, object]], sessions: list[ExaminationS
     date_format = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm:ss.000", "font_color": "#243B53"})
     number_format = workbook.add_format({"num_format": "0.000"})
 
-    data_sheet = workbook.add_worksheet("Sensor Data")
-    data_sheet.hide_gridlines(2)
     headers = list(rows[0]) if rows else ["timestamp", "subject_id", "session_id", "protocol_stage", "sensor_channel",
                                                 "raw_value", "calibrated_value", "measurement_unit", "signal_quality", "event_marker"]
-    data_sheet.write_row(0, 0, headers, header)
-    for row_index, row in enumerate(rows, start=1):
-        for column_index, key in enumerate(headers):
-            value = row.get(key, "")
-            if key == "timestamp" and value:
-                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC).replace(tzinfo=None)
-                data_sheet.write_datetime(row_index, column_index, parsed, date_format)
-            elif isinstance(value, (int, float)):
-                data_sheet.write_number(row_index, column_index, value, number_format)
-            else:
-                data_sheet.write(row_index, column_index, spreadsheet_safe(value))
-    if rows:
-        data_sheet.add_table(0, 0, len(rows), len(headers) - 1, {
-            "name": "SensorData", "style": "Table Style Medium 2", "columns": [{"header": item} for item in headers],
-        })
-    else:
-        data_sheet.autofilter(0, 0, 0, len(headers) - 1)
-    data_sheet.freeze_panes(1, 0)
-    data_sheet.set_column(0, 0, 24)
-    data_sheet.set_column(1, 4, 20)
-    data_sheet.set_column(5, 7, 18)
-    data_sheet.set_column(8, len(headers) - 1, 22)
+
+    def add_data_sheet(name: str, table_name: str, sheet_rows: list[dict[str, object]]) -> None:
+        sheet = workbook.add_worksheet(name)
+        sheet.hide_gridlines(2)
+        sheet.write_row(0, 0, headers, header)
+        for row_index, row in enumerate(sheet_rows, start=1):
+            for column_index, key in enumerate(headers):
+                value = row.get(key, "")
+                if key == "timestamp" and value:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC).replace(tzinfo=None)
+                    sheet.write_datetime(row_index, column_index, parsed, date_format)
+                elif isinstance(value, (int, float)):
+                    sheet.write_number(row_index, column_index, value, number_format)
+                else:
+                    sheet.write(row_index, column_index, spreadsheet_safe(value))
+        if sheet_rows:
+            sheet.add_table(0, 0, len(sheet_rows), len(headers) - 1, {
+                "name": table_name, "style": "Table Style Medium 2", "columns": [{"header": item} for item in headers],
+            })
+        else:
+            sheet.autofilter(0, 0, 0, len(headers) - 1)
+        sheet.freeze_panes(1, 0)
+        sheet.set_column(0, 0, 24)
+        sheet.set_column(1, 4, 20)
+        sheet.set_column(5, 7, 18)
+        sheet.set_column(8, len(headers) - 1, 22)
+
+    groups = [
+        ("EMG Data", "EmgData", lambda channel: channel.startswith("emg")),
+        ("Tongue Pressure", "TonguePressureData", lambda channel: channel.startswith("fsr")),
+        ("Lip Force", "LipForceData", lambda channel: channel.startswith("lip_force")),
+    ]
+    for sheet_name, table_name, matches in groups:
+        sheet_rows = [row for row in rows if matches(str(row.get("sensor_channel", "")).lower())]
+        if sheet_rows:
+            add_data_sheet(sheet_name, table_name, sheet_rows)
+    other_rows = [row for row in rows if not any(
+        matches(str(row.get("sensor_channel", "")).lower()) for _, _, matches in groups
+    )]
+    if other_rows:
+        add_data_sheet("Other Sensors", "OtherSensorData", other_rows)
+    if not rows:
+        add_data_sheet("Sensor Data", "SensorData", [])
 
     chart_sheet = workbook.add_worksheet("Charts")
     chart_sheet.hide_gridlines(2)
     chart_sheet.set_column("A:A", 3)
-    chart_sheet.set_column("B:M", 12)
+    chart_sheet.set_column("B:B", 14)
+    chart_sheet.set_column("C:C", 34)
+    chart_sheet.set_column("D:M", 12)
     chart_sheet.write("B2", "Tongue Smart - Laporan Pemeriksaan", title)
     chart_sheet.write("B4", "Dibuat", label)
     chart_sheet.write_datetime("C4", created_at.astimezone(UTC).replace(tzinfo=None), date_format)
@@ -1106,16 +1127,17 @@ def build_xlsx_export(rows: list[dict[str, object]], sessions: list[ExaminationS
         for row_index, (timestamp, value) in enumerate(points, start=1):
             chart_sheet.write_datetime(row_index, time_col, timestamp, date_format)
             chart_sheet.write_number(row_index, value_col, value)
-        chart = workbook.add_chart({"type": "line"})
+        chart = workbook.add_chart({"type": "scatter", "subtype": "straight"})
         chart.add_series({
             "name": f"{session_code} - {channel}",
             "categories": ["Charts", 1, time_col, len(points), time_col],
             "values": ["Charts", 1, value_col, len(points), value_col],
             "line": {"color": palette[index % len(palette)], "width": 2},
+            "marker": {"type": "none"},
         })
         chart.show_hidden_data()
         chart.set_title({"name": f"{channel} ({unit})"})
-        chart.set_x_axis({"name": "Waktu", "date_axis": True, "num_format": "hh:mm:ss", "major_gridlines": {"visible": False}})
+        chart.set_x_axis({"name": "Waktu", "num_format": "hh:mm:ss.000", "major_gridlines": {"visible": False}})
         chart.set_y_axis({"name": unit, "major_gridlines": {"visible": True, "line": {"color": line}}})
         chart.set_legend({"position": "top"})
         chart.set_chartarea({"border": {"none": True}, "fill": {"color": "#FFFFFF"}})

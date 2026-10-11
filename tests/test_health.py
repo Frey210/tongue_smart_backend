@@ -3,11 +3,12 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from io import BytesIO
+from types import SimpleNamespace
 from zipfile import ZipFile
 from uuid import uuid4
 
 from tongue_smart.database import SessionLocal
-from tongue_smart.main import app
+from tongue_smart.main import ExportCreate, app, build_xlsx_export
 from tongue_smart.models import UserRecord
 from tongue_smart.security import hash_password
 
@@ -26,6 +27,25 @@ def test_health() -> None:
     with TestClient(app) as client:
         assert client.get("/health").json() == {"status": "ok"}
         assert client.get("/ready").json() == {"status": "ready"}
+
+
+def test_xlsx_export_splits_sensor_tabs_and_uses_time_scatter_charts() -> None:
+    timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    rows = [
+        {"timestamp": timestamp, "session_id": "SESS-TEST", "sensor_channel": channel,
+         "raw_value": value, "calibrated_value": value, "measurement_unit": unit}
+        for channel, value, unit in (("fsr_1", 12.4, "kPa"), ("emg_1", 120.0, "uV"), ("lip_force_1", 8.2, "N"))
+    ]
+    content = build_xlsx_export(
+        rows, [SimpleNamespace(session_code="SESS-TEST")],
+        ExportCreate(session_ids=["session-id"], file_format="xlsx"), datetime.now(UTC),
+    )
+    with ZipFile(BytesIO(content)) as workbook:
+        workbook_xml = workbook.read("xl/workbook.xml").decode()
+        assert all(name in workbook_xml for name in ("EMG Data", "Tongue Pressure", "Lip Force", "Charts"))
+        chart_names = [name for name in workbook.namelist() if name.startswith("xl/charts/chart")]
+        assert len(chart_names) == 3
+        assert all(b"scatterChart" in workbook.read(name) for name in chart_names)
 
 
 def test_idempotent_firmware_contract() -> None:
@@ -230,7 +250,9 @@ def test_session_lifecycle_and_idempotent_batch_receipt(monkeypatch) -> None:
         with ZipFile(BytesIO(xlsx_download.content)) as workbook:
             names = set(workbook.namelist())
             assert "xl/worksheets/sheet1.xml" in names and "xl/worksheets/sheet2.xml" in names
-            assert any(name.startswith("xl/charts/chart") for name in names)
+            assert "Tongue Pressure" in workbook.read("xl/workbook.xml").decode()
+            chart_names = [name for name in names if name.startswith("xl/charts/chart")]
+            assert chart_names and all(b"scatterChart" in workbook.read(name) for name in chart_names)
         assert client.delete(f"/api/v1/exports/{xlsx_export.json()['id']}", headers=headers).status_code == 204
         assert client.delete(f"/api/v1/exports/{export.json()['id']}", headers=headers).status_code == 204
         assert client.get(f"/api/v1/exports/{export.json()['id']}/download", headers=headers).status_code == 404
