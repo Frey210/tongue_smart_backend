@@ -46,3 +46,17 @@ py -m venv .venv
 ```
 
 Rencana implementasi: [PLAN.md](PLAN.md).
+
+## EMG baseline release (firmware 0.7.0)
+
+EMG recording now requires a session-specific baseline acknowledged by the
+device. The additive `emg_baselines` table is created by the existing startup
+schema initialization; existing measurements are not recalculated.
+Device reports capturing/review/ready/failed to
+`POST /api/v1/device/sessions/{session_id}/emg-baseline/{control_id}`.
+An operator/researcher/admin confirms review via
+`POST /api/v1/sessions/{session_id}/emg-baseline/confirm?control_id=...`.
+Confirmation returns accepted; only device ready permits recording. Baseline
+samples are not ingested as examination results. The matching web UI and
+firmware must be rolled out together. Older firmware cannot complete this flow.
+The Python simulator supplies synthetic baseline statistics, never patient data.

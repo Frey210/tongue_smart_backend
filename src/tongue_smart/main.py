@@ -22,7 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine, get_db
-from .models import AuditEventRecord, DeviceEventRecord, DevicePairingRecord, DeviceRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SessionControlRecord, SubjectRecord, UserRecord
+from .models import AuditEventRecord, DeviceEventRecord, DevicePairingRecord, DeviceRecord, EmgBaselineRecord, EventMarkerRecord, ExaminationSessionRecord, ExportJobRecord, OperatorNoteRecord, RefreshSessionRecord, RegistrationRequestRecord, SampleBatchRecord, SessionControlRecord, SubjectRecord, UserRecord
 from .security import (
     create_access_token,
     decode_access_token,
@@ -179,6 +179,23 @@ class SessionControlCreate(BaseModel):
     fsr_point: Literal["median_anterior", "median_middle", "median_posterior", "lateral_left", "lateral_right"] | None = None
 
 
+class EmgBaselineMetrics(BaseModel):
+    samples: int = Field(ge=800, le=3000)
+    duration_ms: int = Field(ge=9500, le=15000)
+    mean_mv: float = Field(ge=100, le=3000, allow_inf_nan=False)
+    noise_mv: float = Field(ge=0, le=25, allow_inf_nan=False)
+    span_mv: float = Field(ge=0, le=100, allow_inf_nan=False)
+    drift_mv: float = Field(ge=0, le=30, allow_inf_nan=False)
+    clipped_frames: int = Field(ge=0, le=0)
+
+
+class EmgBaselineReport(BaseModel):
+    state: Literal["capturing", "review", "ready", "failed"]
+    reason: str = Field(default="", max_length=160)
+    metrics: EmgBaselineMetrics | None = None
+    firmware_version: str = Field(default="0.7.0", min_length=1, max_length=32)
+
+
 class DeviceEvent(BaseModel):
     schema_version: int = Field(default=1, ge=1)
     message_id: str = Field(min_length=1, max_length=96)
@@ -251,6 +268,19 @@ def control_view(control: SessionControlRecord | None) -> dict[str, object] | No
 def latest_control(db: Session, session_id: str) -> SessionControlRecord | None:
     return db.scalar(select(SessionControlRecord).where(SessionControlRecord.session_id == session_id)
                      .order_by(desc(SessionControlRecord.created_at)).limit(1))
+
+
+def latest_emg_baseline(db: Session, session_id: str) -> EmgBaselineRecord | None:
+    return db.scalar(select(EmgBaselineRecord).where(EmgBaselineRecord.session_id == session_id)
+                     .order_by(desc(EmgBaselineRecord.created_at)).limit(1))
+
+
+def emg_baseline_view(record: EmgBaselineRecord | None) -> dict[str, object] | None:
+    if record is None:
+        return None
+    return {"control_id": record.control_id, "state": record.state, "reason": record.reason,
+            "metrics": record.metrics, "created_at": record.created_at,
+            "processing": record.metrics.get("processing", "mean32-rms250-ema150-v1"), "gain_verified": False}
 
 
 def add_audit(db: Session, actor_id: str, action: str, entity_type: str, entity_id: str, detail: str = "") -> None:
@@ -841,7 +871,7 @@ def ingest_sample_batch(
     authenticated_device: DeviceRecord | None = Depends(require_device_key),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    session = db.get(ExaminationSessionRecord, session_id)
+    session = db.scalar(select(ExaminationSessionRecord).where(ExaminationSessionRecord.id == session_id).with_for_update())
     if session is None:
         raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
     if session.status != "active":
@@ -863,6 +893,11 @@ def ingest_sample_batch(
         if existing.checksum != computed or existing.session_id != session_id:
             raise HTTPException(status_code=409, detail="message_id telah digunakan untuk payload berbeda")
         return {"receipt_id": existing.id, "duplicate": True, "sequence": existing.sequence, "received_at": existing.received_at}
+    if any(sample.sensor_channel == "emg_1" for sample in payload.samples):
+        baseline = latest_emg_baseline(db, session_id)
+        control = latest_control(db, session_id)
+        if baseline is None or baseline.state != "ready" or control is None or control.measurement != "emg" or control.phase != "recording":
+            raise HTTPException(status_code=409, detail="Data EMG memerlukan baseline siap dan tahap recording")
     record = SampleBatchRecord(id=str(uuid4()), session_id=session_id, device_id=payload.device_id,
                                message_id=payload.message_id, sequence=payload.sequence, checksum=computed,
                                samples=sample_data, received_at=datetime.now(UTC))
@@ -893,6 +928,7 @@ def active_device_sessions(
         item = examination_view(record, db)
         item["next_sequence"] = 0 if last_sequence is None else last_sequence + 1
         item["control"] = control_view(latest_control(db, record.id))
+        item["emg_baseline"] = emg_baseline_view(latest_emg_baseline(db, record.id))
         result.append(item)
     return result
 
@@ -915,13 +951,19 @@ def set_session_control(
     actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    session = db.get(ExaminationSessionRecord, session_id)
+    session = db.scalar(select(ExaminationSessionRecord).where(ExaminationSessionRecord.id == session_id).with_for_update())
     if session is None:
         raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
     if session.status != "active":
         raise HTTPException(status_code=409, detail="Kontrol pengukuran hanya tersedia untuk sesi aktif")
     if payload.measurement not in session.modules:
         raise HTTPException(status_code=422, detail="Modul tidak dipilih pada sesi ini")
+    baseline = latest_emg_baseline(db, session_id)
+    if payload.measurement == "emg" and payload.phase == "recording" and (baseline is None or baseline.state != "ready"):
+        raise HTTPException(status_code=409, detail="Ambil dan konfirmasi baseline EMG; tunggu perangkat menyatakan siap")
+    if baseline and baseline.state in ("requested", "capturing", "review", "accepted"):
+        baseline.state = "cancelled"
+        baseline.reason = "Kontrol tahap berubah; baseline belum diterapkan"
     if payload.measurement == "tongue_pressure" and payload.phase in ("baseline", "recording") and payload.fsr_point is None:
         raise HTTPException(status_code=422, detail="Titik ukur FSR wajib dipilih")
     now = datetime.now(UTC)
@@ -931,6 +973,13 @@ def set_session_control(
                                    fsr_point=payload.fsr_point if payload.measurement == "tongue_pressure" else None,
                                    created_at=now)
     db.add(control)
+    if payload.measurement == "emg" and payload.phase == "baseline":
+        if not session.electrode_site:
+            raise HTTPException(status_code=422, detail="Lokasi elektroda EMG wajib dipilih")
+        db.flush()
+        db.add(EmgBaselineRecord(control_id=control.id, session_id=session_id, device_id=session.device_id,
+                                 state="requested", reason="Menunggu perangkat; rileks dan jangan pindahkan elektroda",
+                                 metrics={}, created_at=now))
     phase_label = {"baseline": "Mulai baseline", "recording": "Mulai ukur", "paused": "Jeda", "completed": "Selesai tahap"}[payload.phase]
     db.add(EventMarkerRecord(id=str(uuid4()), session_id=session_id, actor_id=actor.id,
                              protocol_stage=payload.protocol_stage, label=phase_label,
@@ -939,6 +988,74 @@ def set_session_control(
               f"{control.measurement}:{control.phase}:{control.fsr_point or '-'}")
     db.commit()
     return control_view(control) or {}
+
+
+@app.post("/api/v1/device/sessions/{session_id}/emg-baseline/{control_id}", tags=["ingest"])
+def report_emg_baseline(
+    session_id: str, control_id: str, payload: EmgBaselineReport,
+    authenticated_device: DeviceRecord | None = Depends(require_device_key),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.scalar(select(ExaminationSessionRecord).where(ExaminationSessionRecord.id == session_id).with_for_update())
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    if (authenticated_device and authenticated_device.device_id != session.device_id) or (
+        authenticated_device is None and session.device_id != "tongue-smart-v3"
+    ):
+        raise HTTPException(status_code=403, detail="Credential perangkat tidak sesuai sesi")
+    record = latest_emg_baseline(db, session_id)
+    current = latest_control(db, session_id)
+    if session.status != "active" or record is None or record.control_id != control_id:
+        raise HTTPException(status_code=409, detail="Baseline kedaluwarsa atau sesi tidak aktif")
+    if record.state == payload.state:
+        return emg_baseline_view(record)
+    if record.state == "cancelled":
+        raise HTTPException(status_code=409, detail="Baseline dibatalkan")
+    transitions = {"requested": {"capturing", "review", "failed"}, "capturing": {"review", "failed"},
+                   "review": {"failed"}, "accepted": {"ready", "failed"}, "ready": {"failed"}, "failed": set()}
+    if payload.state not in transitions.get(record.state, set()):
+        raise HTTPException(status_code=409, detail="Urutan baseline tidak sesuai")
+    if payload.state in ("capturing", "review", "ready") and (
+        current is None or current.id != control_id or current.phase != "baseline"
+    ):
+        raise HTTPException(status_code=409, detail="Kontrol baseline sudah berubah")
+    if payload.state == "review":
+        if payload.metrics is None:
+            raise HTTPException(status_code=422, detail="Statistik baseline wajib dikirim")
+        record.metrics = {**payload.metrics.model_dump(), "processing": "mean32-rms250-ema150-v1",
+                          "gain_assumed": 1000, "gain_verified": False, "firmware_version": payload.firmware_version}
+    if authenticated_device:
+        authenticated_device.firmware_version = payload.firmware_version
+    record.state, record.reason = payload.state, payload.reason
+    if payload.state == "failed" and current and current.measurement == "emg" and current.phase == "recording":
+        db.add(SessionControlRecord(id=str(uuid4()), session_id=session_id, actor_id=current.actor_id,
+                                    measurement="emg", phase="paused", protocol_stage=current.protocol_stage,
+                                    fsr_point=None, created_at=datetime.now(UTC)))
+    db.commit()
+    return emg_baseline_view(record)
+
+
+@app.post("/api/v1/sessions/{session_id}/emg-baseline/confirm", tags=["sessions"])
+def confirm_emg_baseline(
+    session_id: str, control_id: str = Query(min_length=1, max_length=36),
+    actor: UserRecord = Depends(require_roles("admin", "operator", "researcher")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.scalar(select(ExaminationSessionRecord).where(ExaminationSessionRecord.id == session_id).with_for_update())
+    record = latest_emg_baseline(db, session_id)
+    current = latest_control(db, session_id)
+    if session is None or record is None:
+        raise HTTPException(status_code=404, detail="Baseline tidak ditemukan")
+    if session.status != "active" or record.control_id != control_id or current is None or current.id != control_id:
+        raise HTTPException(status_code=409, detail="Baseline bukan milik tahap aktif")
+    if record.state not in ("review", "accepted", "ready"):
+        raise HTTPException(status_code=409, detail="Tunggu hasil baseline yang lolos pemeriksaan")
+    if record.state == "review":
+        record.state = "accepted"
+        record.reason = "Dikonfirmasi operator; menunggu perangkat menerapkan baseline"
+        add_audit(db, actor.id, "emg.baseline_confirmed", "examination_session", session_id, control_id)
+        db.commit()
+    return emg_baseline_view(record)
 
 
 @app.get("/api/v1/sessions/{session_id}/results", tags=["results"])
@@ -963,6 +1080,7 @@ def session_results(
     notes = db.scalars(select(OperatorNoteRecord).where(OperatorNoteRecord.session_id == session_id).order_by(desc(OperatorNoteRecord.created_at))).all()
     return {
         "session": examination_view(session, db), "control": control_view(latest_control(db, session_id)),
+        "emg_baseline": emg_baseline_view(latest_emg_baseline(db, session_id)),
         "channels": channels, "selected_channel": sensor_channel,
         "sample_count": len(samples), "batch_count": len(batches), "downsample_stride": stride,
         "summary": {"minimum": min(values) if values else None, "maximum": max(values) if values else None,

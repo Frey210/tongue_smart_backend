@@ -142,6 +142,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def simulate_emg_baseline(client: DeviceClient, current: dict, starts: dict[str, float], now: float, dry_run: bool = False) -> bool:
+    control = current.get("control") or {}
+    if control.get("measurement") != "emg" or control.get("phase") != "baseline":
+        return False
+    baseline = current.get("emg_baseline") or {}
+    cid = control["id"]
+    endpoint = f"/device/sessions/{current['id']}/emg-baseline/{cid}"
+    state = baseline.get("state")
+    if dry_run:
+        print("Dry run: EMG baseline state " + str(state))
+        return True
+    if state == "requested":
+        starts[cid] = now
+        client.request("POST", endpoint, {"state": "capturing", "reason": "Simulasi sintetis: countdown + baseline 10 detik"})
+    elif state == "capturing":
+        started = starts.setdefault(cid, now)
+        if now - started >= 13:
+            client.request("POST", endpoint, {"state": "review", "reason": "Data simulasi, bukan pengukuran sensor",
+                "metrics": {"samples": 1000, "duration_ms": 10000, "mean_mv": 1500,
+                            "noise_mv": 5, "span_mv": 20, "drift_mv": 2, "clipped_frames": 0}})
+    elif state == "accepted":
+        client.request("POST", endpoint, {"state": "ready", "reason": "Baseline simulasi diterapkan; gain tidak terverifikasi"})
+    print("EMG baseline: " + str(state) + "; measurement samples are not generated")
+    return True
+
+
 def main() -> int:
     args = parse_args()
     if args.duration <= 0 or args.sample_rate <= 0 or not 1 <= args.batch_size <= 166:
@@ -184,6 +210,7 @@ def main() -> int:
     target = int(args.duration * args.sample_rate)
     sent = 0
     stopped = False
+    baseline_starts: dict[str, float] = {}
 
     def stop(*_: object) -> None:
         nonlocal stopped
@@ -197,6 +224,10 @@ def main() -> int:
             print("Session is no longer active. Simulator stopped.")
             break
         control = current.get("control")
+        if simulate_emg_baseline(client, current, baseline_starts, time.monotonic(), args.dry_run):
+            if args.dry_run: return 0
+            time.sleep(max(1.0, args.interval))
+            continue
         if not control or control["phase"] == "paused":
             print("Waiting for measurement control from dashboard…")
             time.sleep(max(1.0, args.interval))

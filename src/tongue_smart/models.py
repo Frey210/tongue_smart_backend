@@ -207,3 +207,15 @@ class SessionControlRecord(Base):
     protocol_stage: Mapped[str] = mapped_column(String(64))
     fsr_point: Mapped[str | None] = mapped_column(String(48), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class EmgBaselineRecord(Base):
+    __tablename__ = "emg_baselines"
+
+    control_id: Mapped[str] = mapped_column(ForeignKey("session_controls.id"), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("examination_sessions.id"), index=True)
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(24))
+    reason: Mapped[str] = mapped_column(String(160), default="")
+    metrics: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
