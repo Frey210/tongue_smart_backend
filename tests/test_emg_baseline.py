@@ -38,6 +38,7 @@ def test_emg_baseline_confirmation_requires_device_ack_and_handles_stop():
     with TestClient(app) as client:
         headers, device, sid, device_id = prepare(client)
         control = {"measurement": "emg", "protocol_stage": "emg_masseter_right", "phase": "recording"}
+        assert client.post(f"/api/v1/sessions/{sid}/control", headers=headers, json={**control, "phase": "baseline", "protocol_stage": "emg_temporalis_left"}).status_code == 422
         assert client.post(f"/api/v1/sessions/{sid}/control", headers=headers, json=control).status_code == 409
         request = client.post(f"/api/v1/sessions/{sid}/control", headers=headers, json={**control, "phase": "baseline"}).json()
         cid = request["id"]
@@ -61,6 +62,10 @@ def test_emg_baseline_confirmation_requires_device_ack_and_handles_stop():
                     "calibrated_value": 15.0, "signal_quality": "good"}]
         batch = {"device_id": device_id, "message_id": "baseline-batch-1", "sequence": 0, "samples": samples,
                  "checksum": hashlib.sha256(json.dumps(samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        wrong_samples = [{**samples[0], "protocol_stage": "emg_temporalis_left"}]
+        wrong_batch = {**batch, "message_id": "wrong-site", "samples": wrong_samples,
+                       "checksum": hashlib.sha256(json.dumps(wrong_samples, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        assert client.post(f"/api/v1/sessions/{sid}/batches", headers=device, json=wrong_batch).status_code == 409
         assert client.post(f"/api/v1/sessions/{sid}/batches", headers=device, json=batch).status_code == 202
         assert client.post(endpoint, headers=device, json={"state": "failed", "reason": "Device restarted"}).status_code == 200
         result = client.get(f"/api/v1/sessions/{sid}/results", headers=headers).json()

@@ -898,6 +898,8 @@ def ingest_sample_batch(
         control = latest_control(db, session_id)
         if baseline is None or baseline.state != "ready" or control is None or control.measurement != "emg" or control.phase != "recording":
             raise HTTPException(status_code=409, detail="Data EMG memerlukan baseline siap dan tahap recording")
+        if any(sample.protocol_stage != control.protocol_stage for sample in payload.samples if sample.sensor_channel == "emg_1"):
+            raise HTTPException(status_code=409, detail="Tahap data EMG tidak sesuai kontrol terbaru")
     record = SampleBatchRecord(id=str(uuid4()), session_id=session_id, device_id=payload.device_id,
                                message_id=payload.message_id, sequence=payload.sequence, checksum=computed,
                                samples=sample_data, received_at=datetime.now(UTC))
@@ -958,6 +960,8 @@ def set_session_control(
         raise HTTPException(status_code=409, detail="Kontrol pengukuran hanya tersedia untuk sesi aktif")
     if payload.measurement not in session.modules:
         raise HTTPException(status_code=422, detail="Modul tidak dipilih pada sesi ini")
+    if payload.measurement == "emg" and payload.protocol_stage != f"emg_{session.electrode_site}":
+        raise HTTPException(status_code=422, detail="Tahap EMG harus sesuai lokasi elektroda pada sesi")
     baseline = latest_emg_baseline(db, session_id)
     if payload.measurement == "emg" and payload.phase == "recording" and (baseline is None or baseline.state != "ready"):
         raise HTTPException(status_code=409, detail="Ambil dan konfirmasi baseline EMG; tunggu perangkat menyatakan siap")
