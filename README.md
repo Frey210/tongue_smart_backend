@@ -60,3 +60,11 @@ Confirmation returns accepted; only device ready permits recording. Baseline
 samples are not ingested as examination results. The matching web UI and
 firmware must be rolled out together. Older firmware cannot complete this flow.
 The Python simulator supplies synthetic baseline statistics, never patient data.
+
+## EMG baseline relaxation (firmware 0.7.1)
+
+Resting-baseline noise/span/drift are review information, not hard quality
+thresholds. Device 0.7.1 reports the mean of valid frames and marks the estimator
+`mean-valid-frames-v2`; at most 5% discarded ADC frames is accepted. Minimum
+sample/duration and voltage bounds still apply. Confirmation/device-ready gates
+are unchanged. This is baseline offset referencing, not clinical gain calibration.

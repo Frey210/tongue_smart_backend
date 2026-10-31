@@ -183,10 +183,11 @@ class EmgBaselineMetrics(BaseModel):
     samples: int = Field(ge=800, le=3000)
     duration_ms: int = Field(ge=9500, le=15000)
     mean_mv: float = Field(ge=100, le=3000, allow_inf_nan=False)
-    noise_mv: float = Field(ge=0, le=25, allow_inf_nan=False)
-    span_mv: float = Field(ge=0, le=100, allow_inf_nan=False)
-    drift_mv: float = Field(ge=0, le=30, allow_inf_nan=False)
-    clipped_frames: int = Field(ge=0, le=0)
+    noise_mv: float = Field(ge=0, le=3050, allow_inf_nan=False)
+    span_mv: float = Field(ge=0, le=3050, allow_inf_nan=False)
+    drift_mv: float = Field(ge=0, le=3050, allow_inf_nan=False)
+    clipped_frames: int = Field(ge=0, le=150)
+    estimator: Literal["mean-all-frames-v1", "mean-valid-frames-v2"] = "mean-all-frames-v1"
 
 
 class EmgBaselineReport(BaseModel):
@@ -1026,6 +1027,9 @@ def report_emg_baseline(
     if payload.state == "review":
         if payload.metrics is None:
             raise HTTPException(status_code=422, detail="Statistik baseline wajib dikirim")
+        total = payload.metrics.samples + payload.metrics.clipped_frames
+        if total > 3000 or payload.metrics.clipped_frames * 20 > total:
+            raise HTTPException(status_code=422, detail="Frame ADC jenuh melebihi 5%; periksa sinyal lalu ulangi")
         record.metrics = {**payload.metrics.model_dump(), "processing": "mean32-rms250-ema150-v1",
                           "gain_assumed": 1000, "gain_verified": False, "firmware_version": payload.firmware_version}
     if authenticated_device:

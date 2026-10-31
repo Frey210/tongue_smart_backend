@@ -47,8 +47,13 @@ def test_emg_baseline_confirmation_requires_device_ack_and_handles_stop():
         assert client.post(confirm, headers=headers).status_code == 409
         assert client.post(endpoint, headers=device, json={"state": "ready"}).status_code == 409
         assert client.post(endpoint, headers=device, json={"state": "capturing"}).status_code == 200
-        assert client.post(endpoint, headers=device, json={"state": "review", "metrics": {**METRICS, "clipped_frames": 1}}).status_code == 422
-        assert client.post(endpoint, headers=device, json={"state": "review", "metrics": METRICS}).json()["state"] == "review"
+        assert client.post(endpoint, headers=device, json={"state": "review", "metrics": {**METRICS, "clipped_frames": 53}}).status_code == 422
+        relaxed_metrics = {**METRICS, "samples": 950, "noise_mv": 80, "span_mv": 400, "drift_mv": 60,
+                           "clipped_frames": 50, "estimator": "mean-valid-frames-v2"}
+        review = client.post(endpoint, headers=device, json={"state": "review", "metrics": relaxed_metrics,
+                            "reason": "High variation; confirm only if relaxed", "firmware_version": "0.7.1"}).json()
+        assert review["state"] == "review" and review["metrics"]["estimator"] == "mean-valid-frames-v2"
+        assert review["metrics"]["mean_mv"] == METRICS["mean_mv"]
         assert client.post(confirm, headers=headers).json()["state"] == "accepted"
         assert client.post(f"/api/v1/sessions/{sid}/control", headers=headers, json=control).status_code == 409
         assert client.post(endpoint, headers=device, json={"state": "ready"}).json()["state"] == "ready"
@@ -83,7 +88,9 @@ def test_baseline_supersession_auth_and_invalid_metrics():
         assert client.post(endpoint, headers=headers, json={"state": "capturing"}).status_code in (401, 503)
         _, wrong_device, _, _ = prepare(client)
         assert client.post(endpoint, headers=wrong_device, json={"state": "capturing"}).status_code == 403
-        for metrics in ({**METRICS, "noise_mv": 100}, {**METRICS, "samples": 50}, {**METRICS, "drift_mv": 31}):
+        for metrics in ({**METRICS, "noise_mv": -1}, {**METRICS, "samples": 50},
+                        {**METRICS, "mean_mv": 0}, {**METRICS, "duration_ms": 1000},
+                        {**METRICS, "drift_mv": 4000}, {**METRICS, "samples": 3000, "clipped_frames": 1}):
             assert client.post(endpoint, headers=device, json={"state": "review", "metrics": metrics}).status_code == 422
         assert client.post(endpoint, headers=device, json={"state": "review", "metrics": METRICS}).status_code == 200
         client.post(f"/api/v1/sessions/{sid}/control", headers=headers, json={**payload, "phase": "paused"})
